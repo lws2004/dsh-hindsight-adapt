@@ -12,7 +12,10 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "plugin.mjs"
+    "plugin.mjs",
+    "recuris.mjs",
+    "RECURIS.md",
+    "test"
   ],
   "license": "UNLICENSED",
   "peerDependencies": {

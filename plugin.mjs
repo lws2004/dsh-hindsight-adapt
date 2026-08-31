@@ -4,12 +4,27 @@
 //
 // 分工原则(见 README): 全部共享逻辑(路由/感知/deny/来源标注/密钥过滤/
 // 策展抽取/注入生成/整合/会话收尾)只存在于共享 CLI hs-memory 一份。
-// 本插件只做三件事(DSH 独有部分):
-//   1. 环境设置: 不声明 OWN_BANK(harness 无独占库, global 即共享区);
+// 本插件只做三件事(DSH 独有部分), 高级语义参考 dsh-memos-remote 的工程处理:
+//   1. 环境设置: 声明 OWN_BANK=dsh(harness 独占库, self 落点);
 //      不设 DEFAULT_BANK —— 写路由默认走位置快速路径(git→项目库, 非 git→global)
-//   2. 会话钩子: pre-step 调 hs-memory inject(自动模式) / turn-stopping 攒批
-//      调 curate / 会话结束调 session-end
+//   2. 会话钩子: pre-step 调 hs-memory inject(自动模式) / turn 攒批调 curate
+//      (批次确认队列: 失败回滚重试、超限应急抽取、结束兜底合并, 杜绝转录丢失)
+//      每 N 次 curate 成功后节流触发 consolidate 与 skill-crystallize
 //   3. 工具层: retain/recall/reflect/status 全部转调 hs-memory
+//
+// v0.2.0 可靠性改进(2026-08-30, 参考 dsh-memos-remote):
+//   - P0: curate 批次不再 splice 即弃 —— 移入 pending 待确认队列; 失败回滚
+//     回缓冲头部重试(同转录上限 2 次, 超过放弃并 warn); 超 MAX_BUFFER_CHARS
+//     时最老批次应急 curate(同 turn 一次)而非直接丢弃; disposed 时 leftover +
+//     pending 转录合并进 session-end, 杜绝"尝试抽取但未确认"的丢失窗口
+//   - P1: 工具调用链(action 行, readDshEvents 已收集)拼入 curate 转录,
+//     让策展模型看到 用户→工具→结果, procedure 抽取更准
+//   - P2: 全量行为 Config 化(无需 schemastery 依赖, apply 第二参合并默认值);
+//     失败/成功日志节流(60s 窗口内同名只打一次); curate 成功后按
+//     consolidateEveryNCurate 节流触发 consolidate; preStep 仅 step===1 且
+//     WeakMap 按 turn 去重注入(对齐 memos-remote, 避免递归/子步骤重复注入)
+//   - P3: 每 crystallizeEveryNCurate 次 curate 成功后异步触发 hs-memory
+//     skill-crystallize(procedure→指令块结晶, 共享 CLI 新增能力)
 //
 // 独立于 @vectorize-io/hindsight-coding-agents(dist 会被插件更新覆盖,
 // 本文件自维护, 更新插件不影响本适配层)。
@@ -23,12 +38,41 @@ export const name = "hindsight";
 export const inject = ["agents"];
 
 const HS_MEMORY = join(homedir(), ".hindsight", "harness-memory.sh"); // 共享 CLI(约定唯一事实源)
-// DSH: 不声明 OWN_BANK、不设 DEFAULT_BANK —— hs-memory 默认即约定路由
-const HS_ENV = { ...process.env };
+// DSH: 独占库为 dsh(self 落点: 会话产物/个人化偏好); 不设 DEFAULT_BANK ——
+// 写路由仍走位置快速路径(git→项目库, 非 git→global), self→dsh
+// 自动注入(light 档)默认只查 OWN_BANK(dsh 仅 10 条技术杂记, 对日常任务不相关):
+// 改查 当前项目库+global(真正的相关知识); HINDSIGHT_INJECT_MIN_SCORE=0.35 过滤
+// 低相似度条(宁缺毋滥)。意图词命中(intent 档)仍全查 当前库+global+dsh。
+const HS_ENV = {
+  ...process.env,
+  HINDSIGHT_OWN_BANK: "dsh",
+  HINDSIGHT_INJECT_LIGHT_BANKS: "current,global",
+  HINDSIGHT_INJECT_MIN_SCORE: "0.35",
+};
 
-// ── 会话行为配置(DSH 独有) ──
-const CURATE_EVERY_N = 3; // 每 N 轮攒批调一次 curate; 设 0 关闭
-const MAX_BUFFER_CHARS = 12000;
+// ── 默认配置(cordis.patch.yml 的 config 键可覆盖, 不引入 schemastery 依赖) ──
+const DEFAULTS = {
+  enabled: true,
+  injectEnabled: true,          // pre-step 自动注入
+  curateEnabled: true,          // turn 攒批自动策展
+  curateEveryN: 3,              // 每 N 轮触发一次 curate(0=关闭, 仅会话结束兜底)
+  maxBufferChars: 12000,        // 转录缓冲上限, 超限时最老批次应急 curate
+  curateTimeoutMs: 90000,       // curate 超时(共享 CLI 上限 120s)
+  injectTimeoutMs: 20000,
+  consolidateEveryNCurate: 5,   // 每 N 次 curate 成功后触发 consolidate(0=关闭)
+  crystallizeEveryNCurate: 3,   // 每 N 次 curate 成功后触发 skill-crystallize(0=关闭)
+  toolsEnabled: true,           // 注册 hindsight_* 工具
+};
+
+function resolveConfig(cfg) {
+  const c = { ...DEFAULTS, ...(cfg || {}) };
+  for (const k of ["curateEveryN", "maxBufferChars", "curateTimeoutMs", "injectTimeoutMs", "consolidateEveryNCurate", "crystallizeEveryNCurate"]) {
+    const n = Number(c[k]);
+    c[k] = Number.isFinite(n) && n >= 0 ? n : DEFAULTS[k];
+  }
+  for (const k of ["enabled", "injectEnabled", "curateEnabled", "toolsEnabled"]) c[k] = c[k] !== false;
+  return c;
+}
 
 // ── 共享 CLI 封装(同步: 工具用) ──
 function hsMemory(args, timeoutMs = 90000) {
@@ -45,7 +89,7 @@ function hsMemory(args, timeoutMs = 90000) {
   }
 }
 
-// ── 异步版: 注入/curate/收尾用(非阻塞, 绝不卡会话) ──
+// ── 异步版: 注入/curate/consolidate/crystallize/收尾用(非阻塞, 绝不卡会话) ──
 function hsMemoryAsync(args, timeoutMs = 30000) {
   return new Promise((resolve) => {
     execFile(
@@ -58,6 +102,16 @@ function hsMemoryAsync(args, timeoutMs = 30000) {
       },
     );
   });
+}
+
+// ── 日志节流(60s 窗口内同名事件只打一次; 对齐 memos-remote 的 noteServerError 节流) ──
+const logTimes = new Map();
+function shouldLog(key, ms = 60000) {
+  const now = Date.now();
+  const last = logTimes.get(key) || 0;
+  if (now - last < ms) return false;
+  logTimes.set(key, now);
+  return true;
 }
 
 // ── 转录解析(从 DSH agent.session.events 提取 turns, 剔除注入的记忆块) ──
@@ -118,8 +172,12 @@ function readDshEvents(events) {
 }
 
 // ── 会话内状态 ──
+// buffers: sessionId -> { turns: [{user, assistant, actions[]}], processed, pending[], curateCount }
+// pending item: { turns, transcript, retries, kind: 'regular'|'evict' }
 const liveAgents = new Map(); // sessionId -> agent
-const buffers = new Map(); // sessionId -> { turns: [{user,assistant}], processed: number }
+const buffers = new Map();
+const retryCounts = new Map(); // transcript -> 连续失败次数(批次重建后仍延续)
+const injectedTurns = new WeakMap(); // agent -> turn(同 turn 只注入一次)
 
 // ── 注入消息(与 dsh.js 同形, 插件来源标记 form=recall) ──
 function injectionMessage(text) {
@@ -141,14 +199,59 @@ function promptOf(messages) {
     .trim();
 }
 
-function workspaceRoot(agent) {
-  return agent?.session?.header?.cwd || process.cwd();
+// ── 转录渲染(P1: 含工具调用链 user→action→assistant) ──
+function renderTranscript(buffer) {
+  const parts = [];
+  for (let i = 0; i < buffer.turns.length; i++) {
+    const t = buffer.turns[i];
+    const lines = [`[第${i + 1}轮]`, `用户: ${t.user || "(空)"}`];
+    for (const a of t.actions || []) lines.push("工具: " + a);
+    lines.push(`助手: ${t.assistant || "(空)"}`);
+    parts.push(lines.join("\n"));
+  }
+  return parts.join("\n\n");
 }
 
-function renderTranscript(buffer) {
-  return buffer.turns
-    .map((t, i) => `[第${i + 1}轮]\n用户: ${t.user || "(空)"}\n助手: ${t.assistant || "(空)"}`)
-    .join("\n\n");
+// ── 异步 curate 执行器: 成功→确认+节流触发 consolidate/crystallize; 失败→回滚重试 ──
+async function runCurate(ctx, cfg, sessionId, st, item) {
+  const r = await hsMemoryAsync(["curate", item.transcript], cfg.curateTimeoutMs);
+  const idx = st.pending.indexOf(item);
+  if (idx >= 0) st.pending.splice(idx, 1);
+  if (r.ok) {
+    retryCounts.delete(item.transcript);
+    st.curateCount += 1;
+    const summary = (r.out || "").split("\n")[0].slice(0, 120);
+    if (shouldLog("curate-ok-" + sessionId)) ctx.logger.info(`hindsight: curate 已确认(${item.turns.length} 轮): ${summary || "OK"}`);
+    maybeConsolidate(ctx, cfg, sessionId, st);
+    void maybeCrystallize(ctx, cfg, sessionId, st); // 非阻塞: 异步探测+触发, 不延长 curate 确认
+    return;
+  }
+  const why = (r.err || r.out || "未知错误").split("\n")[0].slice(0, 160);
+  const fails = (retryCounts.get(item.transcript) || 0) + 1;
+  retryCounts.set(item.transcript, fails);
+  if (item.kind === "evict" || fails >= 3) {
+    if (shouldLog("curate-fail-" + sessionId)) ctx.logger.warn(`hindsight: curate 放弃(${item.turns.length} 轮, 第 ${fails} 次失败): ${why}`);
+    return;
+  }
+  if (shouldLog("curate-fail-" + sessionId)) ctx.logger.warn(`hindsight: curate 失败将回滚重试(${item.turns.length} 轮, 第 ${fails} 次): ${why}`);
+  st.turns.unshift(...item.turns); // 批次回滚到缓冲头部, 等下一轮次再次切批
+}
+
+function maybeConsolidate(ctx, cfg, sessionId, st) {
+  if (cfg.consolidateEveryNCurate <= 0 || st.curateCount % cfg.consolidateEveryNCurate !== 0) return;
+  void hsMemoryAsync(["consolidate"], 90000); // 位置快速路径解析目标库
+  if (shouldLog("consolidate-" + sessionId)) ctx.logger.info("hindsight: 触发 consolidate(整合去重/矛盾)");
+}
+
+async function maybeCrystallize(ctx, cfg, sessionId, st) {
+  if (cfg.crystallizeEveryNCurate <= 0 || st.curateCount % cfg.crystallizeEveryNCurate !== 0) return;
+  const probe = await hsMemoryAsync(["list-banks"], 30000); // 轻量健康探测: 服务器不可用则跳过, 避免无效 LLM 调用
+  if (!probe.ok) {
+    if (shouldLog("crystallize-skip-" + sessionId)) ctx.logger.warn(`hindsight: 跳过 skill-crystallize(Hindsight 不可用): ${(probe.err || "").slice(0, 120)}`);
+    return;
+  }
+  void hsMemoryAsync(["skill-crystallize", "--bank", "repo", "--min", "3"], 120000);
+  if (shouldLog("crystallize-" + sessionId)) ctx.logger.info("hindsight: 触发 skill-crystallize(procedure→指令块结晶)");
 }
 
 // ── 工具: 存记忆(转调 hs-memory; 归属域路由; 无 self=DSH 无独占库) ──
@@ -182,12 +285,13 @@ const toolRetain = {
 const toolRecall = {
   name: "hindsight_recall",
   description:
-    "语义搜索 Hindsight 记忆(经共享 CLI hs-memory, 自动多库合并并标注来源 [库名])。默认: 当前解析库 + coding-agent::global 合并(非 git 时即 global)。bankId: repo(仅项目库)/global(仅全局库)/all(全合并含感知到的其他 agent 库,只读)/显式库名。适合: 用户提到以前聊过的事、需要历史经验/踩坑记录。",
+    "语义搜索 Hindsight 记忆(经共享 CLI hs-memory, 自动多库合并并标注来源 [库名])。默认: 当前解析库 + coding-agent::global 合并(非 git 时即 global)。bankId: repo(仅项目库)/global(仅全局库)/all(全合并含感知到的其他 agent 库,只读)/显式库名。factTypes: observation(默认,整合观察优先,自动去重不重复)/world(只要原始事实)/both(原始事实+observation 并列全取)/skill(只要结晶指令块)。适合: 用户提到以前聊过的事、需要历史经验/踩坑记录。",
   parameters: {
     type: "object",
     properties: {
       query: { type: "string", description: "自然语言查询" },
       bankId: { type: "string", description: "检索范围: 默认合并; repo=项目库; global=全局库; all=全合并; 或显式库名(如 hermes)" },
+      factTypes: { type: "string", enum: ["observation", "world", "both", "skill"], description: "记忆类型选择(默认 observation): observation=只取整合观察(去重); world=只要原始事实; both=原始事实与 observation 并列全取; skill=只要结晶指令块。" },
     },
   },
   execute(args) {
@@ -199,6 +303,11 @@ const toolRecall = {
     else if (want === "global") argv.push("--scope", "global");
     else if (want === "all") argv.push("--scope", "all");
     else if (want) argv.push("--bank", want);
+    const ft = String(args?.factTypes ?? "observation").toLowerCase();
+    if (ft === "world") argv.push("--types", "world,experience", "--prefer-obs", "false");
+    else if (ft === "both") argv.push("--types", "world,experience,observation", "--prefer-obs", "false");
+    else if (ft === "skill") argv.push("--types", "skill");
+    // observation(默认): 不传 --types → 全类型召回 + 共享层 prefer_observations=True → observation 优先且去重
     const r = hsMemory(argv);
     if (!r.ok) return "❌ 检索失败: " + (r.err || r.out);
     return r.out;
@@ -250,23 +359,29 @@ const toolStatus = {
 const TOOLS = [toolRetain, toolRecall, toolReflect, toolStatus];
 
 // ── 会话钩子 ──
-function createHooks() {
+function createHooks(ctx, cfg) {
   return {
     sessionStart({ agent }) {
       const sessionId = agent?.session?.header?.id;
       if (sessionId) liveAgents.set(sessionId, agent);
     },
-    async preStep({ agent, signal }, next) {
+    async preStep({ agent, signal, step, turn }, next) {
       const decision = await next();
       if (decision?.kind !== "enter" || signal?.aborted) return decision;
+      if (!cfg.injectEnabled) return decision;
+      // 仅主步骤注入, 递归/子代理步骤不重复检索(对齐 memos-remote)
+      if (typeof step === "number" && step !== 1) return decision;
       const sessionId = agent?.session?.header?.id;
       if (!sessionId) return decision;
       liveAgents.set(sessionId, agent);
+      // 同一 turn 只尝试注入一次(WeakMap 按 turn 记录, 新 turn 重新允许)
+      if (injectedTurns.get(agent) === turn) return decision;
       const prompt = promptOf(decision.messages);
       if (!prompt) return decision;
       try {
-        const r = await hsMemoryAsync(["inject", prompt], 20000); // 自动模式: 意图词→intent, 短消息不注入
+        const r = await hsMemoryAsync(["inject", prompt], cfg.injectTimeoutMs);
         if (!r.ok || !r.out) return decision;
+        injectedTurns.set(agent, turn);
         const block = r.out
           .split("\n")
           .filter(Boolean)
@@ -284,30 +399,56 @@ function createHooks() {
       if (!sessionId) return;
       try {
         const allTurns = readDshEvents(agent?.session?.events);
-        const st = buffers.get(sessionId) ?? { turns: [], processed: 0 };
+        const st = buffers.get(sessionId) ?? { turns: [], processed: 0, pending: [], curateCount: 0, evictedThisTurn: false };
+        st.evictedThisTurn = false; // 每 turn 重置: 超限应急抽取每轮最多一次
         // 本轮新增轮次(按 processed 游标)
         const fresh = allTurns.slice(st.processed);
         st.processed = allTurns.length;
-        // 配对 user+assistant 追加到缓冲
+        // 配对 user + 工具链(action 归属其后的 assistant 轮) + assistant(P1)
         let user = "";
+        let actions = [];
         for (const t of fresh) {
-          if (t.role === "user") user = t.content;
-          else if (t.role === "assistant" && user) {
-            st.turns.push({ user, assistant: t.content });
+          if (t.role === "user") {
+            user = t.content;
+            actions = [];
+          } else if (t.role === "action") {
+            if (user) actions.push(t.content);
+          } else if (t.role === "assistant" && user) {
+            st.turns.push({ user, actions: [...actions], assistant: t.content });
             user = "";
+            actions = [];
           }
         }
-        let total = st.turns.reduce((s, t) => s + t.user.length + t.assistant.length, 0);
-        while (st.turns.length && total > MAX_BUFFER_CHARS) {
-          total -= st.turns.shift().user.length + st.turns.shift().assistant.length; // shift 丢弃最早
+        // 缓冲上限: 超限时最老批次应急 curate(同 turn 一次), 失败不回滚直接丢
+        const turnLen = (t) => t.user.length + t.assistant.length + (t.actions || []).join("").length;
+        let total = st.turns.reduce((s, t) => s + turnLen(t), 0);
+        if (total > cfg.maxBufferChars && st.turns.length) {
+          const evict = [];
+          while (st.turns.length && total > cfg.maxBufferChars) {
+            const dropped = st.turns.shift();
+            total -= turnLen(dropped);
+            evict.push(dropped);
+          }
+          if (evict.length) {
+            if (cfg.curateEnabled && cfg.curateEveryN > 0 && !st.evictedThisTurn) {
+              st.evictedThisTurn = true;
+              const item = { turns: evict, transcript: renderTranscript({ turns: evict }), retries: 0, kind: "evict" };
+              st.pending.push(item);
+              void runCurate(ctx, cfg, sessionId, st, item);
+            } else if (shouldLog("buffer-drop-" + sessionId)) {
+              ctx.logger.warn(`hindsight: 缓冲超限, 丢弃最老 ${evict.length} 轮(curate 关闭或本 turn 已应急)`);
+            }
+          }
         }
         buffers.set(sessionId, st);
-        if (CURATE_EVERY_N <= 0 || st.turns.length < CURATE_EVERY_N) return;
+        if (!cfg.curateEnabled || cfg.curateEveryN <= 0 || st.turns.length < cfg.curateEveryN) return;
+        // 攒够阈值: 整批移入待确认队列并异步 curate(不再 splice 即弃, P0)
         const batch = st.turns.splice(0, st.turns.length);
-        const transcript = renderTranscript({ turns: batch });
-        void hsMemoryAsync(["curate", transcript], 90000); // 静默失败(共享层已兜底过滤)
-      } catch {
-        /* 静默失败 */
+        const item = { turns: batch, transcript: renderTranscript({ turns: batch }), retries: 0, kind: "regular" };
+        st.pending.push(item);
+        void runCurate(ctx, cfg, sessionId, st, item);
+      } catch (e) {
+        if (shouldLog("turnStopping-" + sessionId)) ctx.logger.warn("hindsight: turnStopping 异常: " + String(e?.message || e));
       }
     },
     disposed({ agent }) {
@@ -317,12 +458,13 @@ function createHooks() {
       const st = buffers.get(sessionId);
       buffers.delete(sessionId);
       try {
-        if (st && st.turns.length) {
-          const transcript = renderTranscript(st);
-          void hsMemoryAsync(["session-end", transcript], 90000);
-        } else {
-          void hsMemoryAsync(["session-end"], 60000);
-        }
+        // leftover(未攒够批次) + pending(尝试抽取但未确认的批次) 合并进 session-end,
+        // 杜绝"curate 在途/失败"导致整批转录丢失的窗口
+        const parts = [];
+        if (st?.turns?.length) parts.push(renderTranscript({ turns: st.turns }));
+        for (const p of st?.pending || []) parts.push(p.transcript);
+        const transcript = parts.join("\n\n");
+        void hsMemoryAsync(["session-end", transcript], 90000);
       } catch {
         /* 静默失败 */
       }
@@ -334,29 +476,32 @@ function toDshParameters(spec) {
   return spec.parameters;
 }
 
-export function apply(ctx) {
-  const hooks = createHooks();
+export function apply(ctx, config) {
+  const cfg = resolveConfig(config);
+  if (!cfg.enabled) return () => undefined;
+  const hooks = createHooks(ctx, cfg);
   ctx.on("agent/session-start", hooks.sessionStart);
   ctx.on("agent/pre-step", hooks.preStep, { prepend: true });
   ctx.on("agent/turn-stopping", hooks.turnStopping);
   ctx.on("agent/disposed", hooks.disposed);
-  ctx.inject(["tools"], (toolCtx) => {
-    for (const spec of TOOLS) {
-      toolCtx.tools.register({
-        name: spec.name,
-        description: spec.description,
-        parameters: toDshParameters(spec),
-        output: {
-          schema: { type: "string" },
-          render: (_args, value) => [{ type: "text", text: value }],
-        },
-        execute(args) {
-          return spec.execute(args ?? {});
-        },
-      });
-    }
-  });
+  if (cfg.toolsEnabled) {
+    ctx.inject(["tools"], (toolCtx) => {
+      for (const spec of TOOLS) {
+        toolCtx.tools.register({
+          name: spec.name,
+          description: spec.description,
+          parameters: toDshParameters(spec),
+          output: {
+            schema: { type: "string" },
+            render: (_args, value) => [{ type: "text", text: value }],
+          },
+          execute(args) {
+            return spec.execute(args ?? {});
+          },
+        });
+      }
+    });
+  }
 }
 
 export default { name, inject, apply };
-
