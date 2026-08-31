@@ -27,9 +27,9 @@
 | ρ 路由 | 检索由工作记忆驱动(`injectWmEnabled` 注入; 进化时按失败域召回 hs-memory) |
 | C 验证门控 | 确定性检查(结构 + 失败模式覆盖度留出), **meta 模型不给自己 patch 投票** |
 | 使用循环 | `agent/turn-stopping` 写轨迹+WM; `agent/pre-step` step1 注入 WM + 命中经验卡 |
-| 进化循环 | `recuris_evolve`: **Wiki Maintainer 提炼持久模式(P6)** → 并行诊断 workers → 合并 → 单组件 patch(regCap) → 门控(含回放) → 卡落盘+追溯+同步 → ledger(含审计) |
+| 进化循环 | `recuris_evolve`: **Wiki Maintainer 提炼持久模式(失败+成功两面)** → 并行诊断 workers → 合并 → 单组件 patch(regCap) → 门控(含回放) → 卡落盘+追溯+同步 → ledger(含审计) |
 | TTA 循环 | **失败后重试自动携带命中卡**(pre-step 注入); `recuris_verify` 离线推演验证|
-| 知识层(P6, WikiSkill) | `patterns/` 持久模式(失败模式+规避), **永不回滚**; 卡 `purpose.patternIds` ↔ 模式 `cards[]` 双向追溯; ledger `audit` 提案审计(防重复提议) |
+| 知识层(P6, WikiSkill) | `patterns/` 持久模式(失败模式+规避 **和/或** 成功策略), **永不回滚**; 卡 `purpose.patternIds` ↔ 模式 `cards[]` 双向追溯; ledger `audit` 提案审计(防重复提议) |
 
 ## 存储布局(默认 `~/.dsh/storages/recuris/`)
 
@@ -41,7 +41,7 @@ trajectories/<sessionId>.jsonl   逐 turn: {t, ts, w(goal摘要), user, actions[
 wm/<sessionId>.json              工作记忆卡(目标/阶段/进度/阻塞/最近动作)
 wm/<sessionId>.note.json         recuris_wm 手动备注
 skills/<cardId>.json             技能卡(唯一可回滚的进化组件, 含 version/history/gate/purpose)
-patterns/<patId>.json            持久模式知识层(Wiki, 永不回滚: 失败模式+规避+引用卡+history)
+patterns/<patId>.json            持久模式知识层(Wiki, 永不回滚: 失败模式+规避 / 成功策略 + 引用卡 + history)
 evolutions/<runId>.jsonl         进化 ledger: 证据 / 诊断 / 合并 / 门控算术 / 审计 / 落卡 / 同步
 ```
 
@@ -49,10 +49,11 @@ evolutions/<runId>.jsonl         进化 ledger: 证据 / 诊断 / 合并 / 门�
 
 | 工具 | 作用 |
 |---|---|
-| `recuris_evolve` | 复盘: `{taskId?, failure}` → **Wiki Maintainer 提炼持久模式** → 诊断 → 合并 → 门控 → 落卡(+PURPOSE 追溯) → ledger(含提案审计) |
+| `recuris_evolve` | 复盘: `{taskId?, failure}` → **Wiki Maintainer 提炼持久模式(失败+成功)** → 诊断 → 合并 → 门控 → 落卡(+PURPOSE 追溯) → ledger(含提案审计) |
 | `recuris_wm` | 读写工作记忆备注(无 goal 时手动维护状态) |
 | `recuris_skills` | 列出/查看技能卡(加 `id` 看全文, 含源自模式) |
-| `recuris_patterns` | **查看持久模式知识库(P6/Wiki 层)**: 失败模式+规避, 永不回滚; 加 `id` 看单模式全文(含引用卡) |
+| `recuris_patterns` | **查看持久模式知识库(P6/Wiki 层)**: 失败模式+规避 / 成功策略, 永不回滚; 加 `id` 看单模式全文(含引用卡) |
+| `recuris_stats` | **演化统计视图(趋势可见性)**: 进化次数/提案接受率/被拒数/卡与模式增长/成功策略占比/最近演化 |
 | `recuris_trace` | 查看某任务的结构化轨迹 |
 | `recuris_verify` | **卡演练(P4b)**: 卡在某任务失败段上离线推演"按卡重做会怎样", 记入卡 verifications 与 ledger |
 | `recuris_export` | **卡→SKILL.md 全局技能(P5)**: 只导 `gate=passed` 卡为 `~/.agents/skills/<id>/SKILL.md`(全机 agent 会话按需可加载); 默认 dryRun 预览 |
@@ -92,9 +93,10 @@ evolutions/<runId>.jsonl         进化 ledger: 证据 / 诊断 / 合并 / 门�
 1. **证据收集**: 本任务轨迹尾部(`evidenceTrajectoryTurns`) + 头 2 轮; 近期其他失败任务
    (`evidenceFailures`); Hindsight 相关经验(`hs-memory recall`, 可关); 域内已有技能卡;
    **持久模式知识层概要 + 最近被拒提案(仅注入给演化器)**, 可关。
-2. **Wiki Maintainer(P6, 借鉴 WikiSkill)**: 用 meta 模型把本次轨迹+观察提炼为
-   **持久模式**(`失败模式 + 可操作规避 + 证据`), 落盘 `patterns/` —— **永不回滚**,
-   跨进化迭代持续累积; 后续技能提案直接吸收其中的 workaround。
+2. **Wiki Maintainer(P6, 借鉴 WikiSkill)**: 用 meta 模型把本次轨迹提炼为
+   **持久模式**, 落盘 `patterns/` —— **永不回滚**, 跨进化迭代持续累积。
+   **两面学习**: 从失败轮提炼 `failure_mode + workaround`(别做什么), 从通过轮提炼
+   `strategy`(该做什么), 同主题可同条并存; 后续技能提案直接吸收其中的 workaround/strategy。
 3. **并行诊断**(`diagnosisWorkers`=3): 三个角度(localization / skill-audit / new-skill),
    每个由**上游 meta 模型**(默认 `opencode-go/deepseek-v4-pro`, 配置 `metaProvider/metaModel`,
    失败自动降级 `metaFallback*`)独立输出结构化诊断(仅 JSON)。
@@ -153,7 +155,7 @@ config:
 ## 使用与验证
 
 1. `node --check recuris.mjs` 通过; 重启 `dsh web`(或确认 HMR 已热载)后,
-   新会话工具表应出现 `recuris_*` 8 个工具(evolve/wm/skills/patterns/trace/verify/export/status)。
+   新会话工具表应出现 `recuris_*` 9 个工具(evolve/wm/skills/patterns/stats/trace/verify/export/status)。
 2. 冒烟测试(不依赖 harness, mock LLM): `node test/recuris.smoke.test.mjs`
 3. 长任务会话中: 失败后对当前会话直接调 `recuris_evolve`(failure 必填),
    或对任意历史会话 `recuris_trace` → `recuris_evolve taskId=<会话id>`。
@@ -191,8 +193,11 @@ config:
 把 Recuris 从"轨迹 → 卡"的直筒结构升级为三层: **raw(轨迹, 不可变) → patterns(知识,
 永不回滚) → skills(卡, 可回滚)**, 与 WikiSkill 的结论对齐——持久知识累积是演化质量的胜负手。
 
-- **Wiki Maintainer**(`runWikiMaintainer`, evolve 第一步): 用 meta 模型从本次轨迹+观察中
-  提炼 `失败模式 + 可操作规避 + 证据` 的持久模式, 落盘 `patterns/<patId>.json`。
+- **Wiki Maintainer**(`runWikiMaintainer`, evolve 第一步): 用 meta 模型从本次轨迹中
+  提炼持久模式, 落盘 `patterns/<patId>.json`。**两面学习(失败+成功)**:
+  - 从**失败轮**(`❌失败` 标记)提炼 `failure_mode`(根因) + `workaround`(规避);
+  - 从**通过轮**提炼 `strategy`(成功策略/何时走该路径) —— 与失败模式互补,
+    同一模式可同时含两面; 只有 strategy 的模式同样有效。
   **永不回滚**: 无论后续门控是否拒绝提案, 模式都保留并在跨迭代中持续累积(同模式名合并,
   证据追加, history 记录每次演化); 因此后续技能提案能"站在已积累知识上"而非重头再来。
 - **卡↔模式双向追溯(PURPOSE 等价)**: 准入卡按 failure_modes 文本重叠自动关联持久模式——
@@ -201,8 +206,10 @@ config:
 - **提案审计(防重复提议)**: ledger 增加 `audit[]`——每个提案记 `{kind, targetCardId, cardName,
   diff, accepted, rejectReason, gateStatus, replay}`。被拒提案进入下次演化的 evidence
   (`attachPersistentKnowledge` 注入), 合并器明确被告知"历史被拒提案, 不要重复提出相同干预"。
-- **人工可查**: `recuris_patterns`(知识层) / ledger 的 `wiki` 与 `audit` 字段 / `recuris_status`
-  显示 wiki 模式总数。
+- **演化统计(`recuris_stats`)**: 汇总 ledger 回答"演化是否在收敛/变好"——进化次数(手动/自动)、
+  提案接受率、被拒数、卡/模式增长、模式中成功策略占比、最近 5 次演化明细。
+- **人工可查**: `recuris_patterns`(知识层) / `recuris_stats`(趋势) / ledger 的 `wiki` 与
+  `audit` 字段 / `recuris_status` 显示 wiki 模式总数。
 - **反直觉经验(已固化全局)**: 知识库只给"演化器"读, 不注入"执行器"上下文——执行时直接抄知识
   会让轨迹失去信息量(论文消融: 注入反而降质); 技能可跨模型/agent 迁移, 小 agent 带技能可超越
   大 agent 无技能。

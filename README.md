@@ -98,8 +98,9 @@ procedure 不足阈值时自动跳过,不产生噪音。
 
 `recuris.mjs`(经 `cordis.patch.yml` 的 `recuris-adapt` 行独立挂载)在薄适配层之上增加
 **记忆进化闭环**: 逐轮结构化轨迹 + 工作记忆状态接地 + 失败后并行诊断/组件级 patch/
-确定性验证门控 + **持久模式知识层(patterns/, 借鉴 WikiSkill arXiv:2608.27454)** +
-提案审计 + 卡→SKILL.md 全局技能导出。详见 [RECURIS.md](RECURIS.md)。
+确定性验证门控 + **持久模式知识层(patterns/, 失败模式+成功策略两面, 借鉴 WikiSkill
+arXiv:2608.27454)** + 提案审计 + 演化统计 + 卡→SKILL.md 全局技能导出。详见
+[RECURIS.md](RECURIS.md)。
 **成本要点**: 被动使用(记录/注入/回放/同步/导出)几乎零 LLM 成本; 仅 `recuris_evolve`
 (≈4 次 pro, 2–6 分钟)与 `recuris_verify`(1 次)按次付费且默认手动触发, 完整核算见
 [RECURIS.md 成本核算](RECURIS.md)。

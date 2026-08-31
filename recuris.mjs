@@ -586,10 +586,14 @@ function replayGate(card, traces, cfg) {
 const WIKI_SYSTEM =
   "你是记忆演化流水线的 Wiki Maintainer(知识库维护者)。只输出一个 JSON 对象, 不要输出任何其他文字。";
 const WIKI_PROMPT = (ev, workers, cap) =>
-  `把失败轨迹与诊断consolidate成"持久模式"(patterns): 每一条 = 一个失败模式 + 可操作规避, 供后续技能提案复用。\n` +
+  `把失败轨迹consolidate成"持久模式"(patterns): 每一条 = 一个失败模式 + 可操作规避(别做什么), ` +
+  `和/或 一个可复用成功策略(该做什么), 供后续技能提案复用。轨迹中含"❌失败"标记的是失败轮, 其余为通过轮:\n` +
+  `- 从失败轮提炼 failure_mode(根因) + workaround(规避);\n` +
+  `- 从通过轮提炼 strategy(成功做法, 何时该走这条路径);\n` +
+  `- 同一条模式可同时含 failure_mode 与 strategy(同一主题的教训+正解), strategy 可选.\n` +
   `要求: ① 模式是知识和教训, 不是某张卡; ② 与已有 wiki 模式重复或近似的不要重复产出(去重后最多 ${cap} 条); ` +
-  `③ workaround 要具体可执行; ④ evidence 用 1-2 句描述出处。\n` +
-  `输出 JSON: {"patterns":[{"name":"...","failure_mode":"...","workaround":"...","evidence":"..."}]}\n\n` +
+  `③ workaround/strategy 要具体可执行; ④ evidence 用 1-2 句描述出处。\n` +
+  `输出 JSON: {"patterns":[{"name":"...","failure_mode":"...或省略","workaround":"...或省略","strategy":"...或省略","evidence":"..."}]}\n\n` +
   `## 已有 wiki 模式\n${ev.wiki || "(无)"}\n\n` +
   `## 失败轨迹\n${ev.trajectory}\n\n## 诊断结果\n${workers}`;
 async function runWikiMaintainer(ctx, cfg, ev, workers) {
@@ -628,9 +632,9 @@ function patternIdOf(name) {
 }
 /**
  * 落盘/合并一条模式(Wiki 永不回滚: 只增不删; 同名近似合并, 追加证据)。
+ * strategy = 成功策略(从通过轨迹提炼的"该怎么做"), 与 failure_mode/workaround 互补。
  */
-function upsertPattern(p, name, failureMode, workaround, evidence, runId) {
-  if (!name || !failureMode) return null;
+function upsertPattern(p, name, failureMode, workaround, strategy, evidence, runId) {
   const id = patternIdOf(name);
   const existing = readPattern(p, id);
   const now = nowIso();
@@ -639,8 +643,9 @@ function upsertPattern(p, name, failureMode, workaround, evidence, runId) {
     next = {
       ...existing,
       name,
-      failure_mode: failureMode,
+      failure_mode: failureMode || existing.failure_mode,
       workaround: workaround || existing.workaround,
+      strategy: strategy || existing.strategy,
       evidence: [...new Set([...(existing.evidence || []), evidence].filter(Boolean))].slice(-6),
       updated: now,
       history: [...(existing.history || []), { runId, ts: now, kind: "merge" }].slice(-10),
@@ -649,8 +654,9 @@ function upsertPattern(p, name, failureMode, workaround, evidence, runId) {
     next = {
       id,
       name,
-      failure_mode: failureMode,
+      failure_mode: failureMode || "",
       workaround: workaround || "",
+      strategy: strategy || "",
       evidence: [evidence].filter(Boolean),
       cards: [],
       created: now,
@@ -658,6 +664,8 @@ function upsertPattern(p, name, failureMode, workaround, evidence, runId) {
       history: [{ runId, ts: now, kind: "create" }],
     };
   }
+  // 至少要有失败模式或成功策略之一才有意义
+  if (!next.failure_mode && !next.strategy) return null;
   if (!writeJson(patternFile(p, id), next)) return null;
   return next;
 }
@@ -665,8 +673,8 @@ function upsertPattern(p, name, failureMode, workaround, evidence, runId) {
 function storePatterns(p, patterns, runId) {
   let created = 0;
   for (const pt of patterns || []) {
-    if (!pt || !pt.failure_mode) continue;
-    if (upsertPattern(p, pt.name || pt.failure_mode.slice(0, 40), pt.failure_mode, pt.workaround, pt.evidence, runId)) created += 1;
+    if (!pt || (!pt.failure_mode && !pt.strategy)) continue;
+    if (upsertPattern(p, pt.name || pt.failure_mode || pt.strategy, pt.failure_mode, pt.workaround, pt.strategy, pt.evidence, runId)) created += 1;
   }
   return { created, total: listPatterns(p).length };
 }
@@ -675,7 +683,13 @@ function renderWiki(p, max = 6) {
   const pats = listPatterns(p).slice(0, max);
   if (!pats.length) return "(无持久模式)";
   return pats
-    .map((t) => `[${t.id}] ${t.name}\n  触发: ${trimText(t.failure_mode, 120)}\n  规避: ${trimText(t.workaround, 140) || "(未写)"}${t.cards?.length ? ` | 已被卡引用: ${t.cards.join(",")}` : ""}`)
+    .map((t) => {
+      const lines = [`[${t.id}] ${t.name}`];
+      if (t.failure_mode) lines.push(`  触发: ${trimText(t.failure_mode, 120)}\n  规避: ${trimText(t.workaround, 140) || "(未写)"}`);
+      if (t.strategy) lines.push(`  成功策略: ${trimText(t.strategy, 140)}`);
+      if (t.cards?.length) lines.push(` | 已被卡引用: ${t.cards.join(",")}`);
+      return lines.join("\n");
+    })
     .join("\n\n");
 }
 /**
@@ -1491,7 +1505,7 @@ const toolStatus = {
 const toolPatterns = {
   name: "recuris_patterns",
   description:
-    "查看持久模式知识库(Recuris 的 Wiki 层, 借鉴 WikiSkill arXiv:2608.27454): 从失败轨迹提炼的『失败模式+可操作规避』, 永不回滚、跨进化迭代累积, 供技能提案复用并与卡双向追溯。可加 id 查看单模式全文(含引用卡)。",
+    "查看持久模式知识库(Recuris 的 Wiki 层, 借鉴 WikiSkill arXiv:2608.27454): 从失败与成功轨迹提炼的『失败模式+规避(别做什么) / 成功策略(该做什么)』, 永不回滚、跨进化迭代累积, 供技能提案复用并与卡双向追溯。可加 id 查看单模式全文(含引用卡)。",
   parameters: {
     type: "object",
     properties: {
@@ -1511,14 +1525,103 @@ const toolPatterns = {
     return pick
       .map((t) =>
         want
-          ? `# ${t.name} [${t.id}]\n失败模式: ${t.failure_mode}\n规避: ${t.workaround || "(未写)"}\n证据: ${(t.evidence || []).join("; ") || "(无)"}\n引用卡: ${t.cards?.join(", ") || "(无)"}\n创建: ${t.created} | 更新: ${t.updated}\n历史: ${(t.history || []).map((h) => `${h.runId}(${h.kind})`).join(" → ")}`
-          : `[${t.id}] ${t.name} | 触发: ${trimText(t.failure_mode, 60)} | 被 ${t.cards?.length || 0} 卡引用`,
+          ? `# ${t.name} [${t.id}]` +
+            (t.failure_mode ? `\n失败模式: ${t.failure_mode}\n规避: ${t.workaround || "(未写)"}` : "") +
+            (t.strategy ? `\n成功策略: ${t.strategy}` : "") +
+            `\n证据: ${(t.evidence || []).join("; ") || "(无)"}\n引用卡: ${t.cards?.join(", ") || "(无)"}\n创建: ${t.created} | 更新: ${t.updated}\n历史: ${(t.history || []).map((h) => `${h.runId}(${h.kind})`).join(" → ")}`
+          : `[${t.id}] ${t.name} | ${t.failure_mode ? "触发: " + trimText(t.failure_mode, 60) : "策略: " + trimText(t.strategy, 60)} | 被 ${t.cards?.length || 0} 卡引用`,
       )
       .join(want ? "\n\n" : "\n");
   },
 };
 
-const TOOLS = [toolEvolve, toolWm, toolSkills, toolTrace, toolVerify, toolExport, toolPatterns, toolStatus];
+/**
+ * 增强 2b: 演化统计视图 —— 汇总 ledger 回答"演化是否在收敛/变好"
+ * (论文表 4 的工程近似: 模式数/卡增长/提案接受率/被拒分布)。
+ */
+function runStats(cfg) {
+  const p = pathsOf(cfg);
+  ensureDirs(p);
+  const evos = listFiles(p.evolutions).filter((f) => f.endsWith(".jsonl"));
+  const cards = listSkillCards(p);
+  const pats = listPatterns(p);
+  const stats = {
+    evolutions: 0,
+    manual: 0,
+    auto: 0,
+    verifyRuns: 0,
+    proposals: 0,
+    accepted: 0,
+    rejected: 0,
+    cardsTotal: cards.length,
+    patternsTotal: pats.length,
+    patternsWithStrategy: pats.filter((t) => t.strategy).length,
+    recent: [],
+  };
+  const byRun = [];
+  for (const f of evos) {
+    const recs = readJsonl(join(p.evolutions, f), 100);
+    for (const r of recs) {
+      if (!r || !r.runId) continue;
+      if (r.kind === "verify") {
+        stats.verifyRuns += 1;
+        continue;
+      }
+      stats.evolutions += 1;
+      if (r.trigger?.includes("auto")) stats.auto += 1;
+      else stats.manual += 1;
+      const audit = Array.isArray(r.audit) ? r.audit : [];
+      stats.proposals += audit.length;
+      for (const a of audit) {
+        if (a.accepted) stats.accepted += 1;
+        else stats.rejected += 1;
+      }
+      byRun.push({
+        runId: r.runId,
+        ts: r.ts,
+        trigger: r.trigger,
+        proposed: audit.length,
+        accepted: audit.filter((a) => a.accepted).length,
+        rejected: audit.filter((a) => !a.accepted).length,
+        cards: (r.applied || []).length,
+      });
+    }
+  }
+  byRun.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+  stats.recent = byRun.slice(-5).reverse();
+  const totalDecisions = stats.accepted + stats.rejected;
+  stats.acceptRate = totalDecisions > 0 ? Math.round((stats.accepted / totalDecisions) * 100) : null;
+  return stats;
+}
+
+const toolStats = {
+  name: "recuris_stats",
+  description:
+    "演化统计视图(Recuris 趋势可见性): 汇总 evolutions ledger 与技能卡/模式库 —— 进化次数(手动/自动)、提案接受率、被拒数、卡/模式增长、模式中成功策略占比、最近 5 次演化。回答『这套进化是否在收敛/变好』。",
+  parameters: { type: "object", properties: {} },
+  execute(_args, exec) {
+    const { cfg } = exec;
+    const s = runStats(cfg);
+    const lines = [
+      `📊 Recuris 演化统计`,
+      `进化运行: ${s.evolutions} 次 (手动 ${s.manual} / 自动 ${s.auto}) | verify 演练: ${s.verifyRuns}`,
+      `提案: 共 ${s.proposals} | 接受 ${s.accepted} / 拒绝 ${s.rejected}` + (s.acceptRate !== null ? ` | 接受率 ${s.acceptRate}%` : ""),
+      `技能卡: ${s.cardsTotal} 张 | 持久模式: ${s.patternsTotal} 条 (含成功策略 ${s.patternsWithStrategy} 条)`,
+    ];
+    if (s.recent.length) {
+      lines.push("最近演化:");
+      for (const r of s.recent) {
+        lines.push(`  ${r.runId} ${r.ts?.slice(0, 16) || "?"} ${r.trigger} 提案 ${r.proposed} (✓${r.accepted}/✗${r.rejected}) 准入卡 ${r.cards}`);
+      }
+    } else {
+      lines.push("(尚无演化记录; 长任务失败后调用 recuris_evolve 生成)");
+    }
+    if (s.rejected > 0) lines.push("提示: 被拒提案会注入下次演化证据, 避免重复提议(见 ledger audit)");
+    return lines.join("\n");
+  },
+};
+
+const TOOLS = [toolEvolve, toolWm, toolSkills, toolTrace, toolVerify, toolExport, toolPatterns, toolStats, toolStatus];
 
 // ── 会话状态 ──
 // liveAgents: sessionId -> agent; traces: sessionId -> { processed, failThisTurn }
@@ -1736,4 +1839,5 @@ export const __test = {
   recentRejectedRuns,
   renderRejected,
   attachPersistentKnowledge,
+  runStats,
 };

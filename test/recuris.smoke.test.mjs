@@ -133,8 +133,10 @@ writeFileSync(
 
 const llm2 = fakeLlm();
 llm2.script([
-  // P6: Wiki Maintainer(先于诊断, 提炼持久模式)
-  { patterns: [{ name: "性能问题先抓基线", failure_mode: "补丁未生效", workaround: "先抓基线指标再归因, 避免猜测定位", evidence: "smoke-task 失败轨迹" }] },
+  // P6: Wiki Maintainer(先于诊断, 提炼持久模式: 失败模式 + 成功策略)
+  { patterns: [
+    { name: "性能问题先抓基线", failure_mode: "补丁未生效", workaround: "先抓基线指标再归因, 避免猜测定位", strategy: "补丁前先跑基准, 补丁后同口径对比验证", evidence: "smoke-task 失败轨迹" },
+  ] },
   { component: "missing-knowledge", diagnosis: "缺性能分析技能卡", observed_failures: ["补丁未生效"], confidence: 0.9 },
   { component: "missing-knowledge", diagnosis: "缺性能分析技能卡", observed_failures: ["补丁未生效"], confidence: 0.8 },
   { card: null, rationale: "无", observed_failures: [] },
@@ -319,12 +321,14 @@ assert.equal(evoLedger.wiki.patternsStored >= 1, true, "ledger 应记录模式�
 assert.ok(evoLedger.applied[0].purpose?.length >= 1, "applied 摘要应含 purpose 追溯");
 // 12d. upsertPattern 合并: 同 id 二次落盘应合并而非覆盖(永不回滚)
 const p6 = m.pathsOf(cfg);
-const first = rel6.upsertPattern(p6, "超时重试", "网络超时", "退避重试", "证据1", "r-a");
+const first = rel6.upsertPattern(p6, "超时重试", "网络超时", "退避重试", "超时后切换到降级路径", "证据1", "r-a");
 assert.equal(first.cards.length, 0);
 assert.equal(first.evidence.length, 1);
-const second = rel6.upsertPattern(p6, "超时重试", "网络超时", "退避重试+降级", "证据2", "r-b");
+assert.equal(first.strategy, "超时后切换到降级路径", "模式应含成功策略字段");
+const second = rel6.upsertPattern(p6, "超时重试", "网络超时", "退避重试+降级", "超时后切换降级并记录日志", "证据2", "r-b");
 assert.equal(second.id, first.id, "同模式名应合并同一 id");
 assert.equal(second.workaround, "退避重试+降级", "workaround 应被新值更新");
+assert.equal(second.strategy, "超时后切换降级并记录日志", "strategy 应被新值更新");
 assert.deepEqual(second.evidence, ["证据1", "证据2"], "证据应追加保留(不丢失历史)");
 assert.equal(second.history.length, 2, "history 应记录两次演化");
 // 12e. 被拒提案审计: 构造一条 rejected ledger, next 演化应能看到
@@ -351,6 +355,23 @@ assert.ok(/^pat-[a-z0-9-]+-[0-9a-f]{8}$/.test(idA), "id 应 ASCII 安全: " + id
 assert.equal(rel6.patternIdOf("补丁验证先看基线"), idA, "同模式名应生成稳定 id");
 assert.notEqual(rel6.patternIdOf("网络超时重试策略"), idA, "不同模式名应生成不同 id");
 assert.ok(!idA.includes("_"), "id 不应含下划线(直接可作文件名)");
+// 12h. 成功策略(增强 1b): 主管线模式应含 strategy, 且 renderWiki/视图呈现
+const patAfter = rel6.listPatterns(m.pathsOf(cfg))[0];
+assert.ok(patAfter.strategy?.includes("基准"), "Wiki Maintainer 应提炼成功策略(strategy)");
+const wikiView = rel6.renderWiki(m.pathsOf(cfg));
+assert.ok(wikiView.includes("成功策略") && wikiView.includes("基准"), "renderWiki 应呈现成功策略");
+// 12i. 演化统计视图(增强 2b): 汇总 ledger 的提案/接受/模式统计
+// 注意: 12e 已构造 evo-rejected.jsonl(1 条被拒提案), 统计应反映两者
+const stats = rel6.runStats(cfg);
+assert.equal(stats.evolutions, 2, "应统计到 2 次进化(本轮 + evo-rejected)");
+assert.equal(stats.proposals, 2, "提案总数=2");
+assert.equal(stats.accepted, 1, "接受=1");
+assert.equal(stats.rejected, 1, "拒绝=1(来自 12e 构造的 evo-rejected)");
+assert.equal(stats.acceptRate, 50, "接受率=50%");
+assert.equal(stats.cardsTotal, 3, "技能卡统计=3(perf-triage + patch-me + soft-card)");
+assert.equal(stats.patternsTotal, rel6.listPatterns(m.pathsOf(cfg)).length, "模式统计与库一致");
+assert.ok(stats.patternsWithStrategy >= 1, "含成功策略的模式应被统计");
+assert.ok(stats.recent.some((r) => r.runId === result.runId), "最近演化列表应包含本轮 runId");
 
 console.log("✅ 冒烟测试全部通过");
 console.log("   runId:", result.runId);
