@@ -62,11 +62,13 @@ const DEFAULTS = {
   consolidateEveryNCurate: 5,   // 每 N 次 curate 成功后触发 consolidate(0=关闭)
   crystallizeEveryNCurate: 3,   // 每 N 次 curate 成功后触发 skill-crystallize(0=关闭)
   toolsEnabled: true,           // 注册 hindsight_* 工具
+  // P7: 工具归属缓解(dsh-context 面板"未知插件")——注册延后给 attribution hook 让路
+  toolsDeferMs: 50,             // tools 就绪后再等 N ms 注册(0=立即)
 };
 
 function resolveConfig(cfg) {
   const c = { ...DEFAULTS, ...(cfg || {}) };
-  for (const k of ["curateEveryN", "maxBufferChars", "curateTimeoutMs", "injectTimeoutMs", "consolidateEveryNCurate", "crystallizeEveryNCurate"]) {
+  for (const k of ["curateEveryN", "maxBufferChars", "curateTimeoutMs", "injectTimeoutMs", "consolidateEveryNCurate", "crystallizeEveryNCurate", "toolsDeferMs"]) {
     const n = Number(c[k]);
     c[k] = Number.isFinite(n) && n >= 0 ? n : DEFAULTS[k];
   }
@@ -485,21 +487,36 @@ export function apply(ctx, config) {
   ctx.on("agent/turn-stopping", hooks.turnStopping);
   ctx.on("agent/disposed", hooks.disposed);
   if (cfg.toolsEnabled) {
+    // P7: 归属缓解(可选) —— tools 就绪后延迟 deferMs 注册, 给 dsh-context
+    // attribution hook 先装机会(默认 50ms, 超时必注册; 0=立即不延迟)。
+    const defer = Math.max(0, Number(cfg.toolsDeferMs) || 0);
     ctx.inject(["tools"], (toolCtx) => {
-      for (const spec of TOOLS) {
-        toolCtx.tools.register({
-          name: spec.name,
-          description: spec.description,
-          parameters: toDshParameters(spec),
-          output: {
-            schema: { type: "string" },
-            render: (_args, value) => [{ type: "text", text: value }],
-          },
-          execute(args) {
-            return spec.execute(args ?? {});
-          },
-        });
-      }
+      const doRegister = () => {
+        for (const spec of TOOLS) {
+          toolCtx.tools.register({
+            name: spec.name,
+            description: spec.description,
+            parameters: toDshParameters(spec),
+            output: {
+              schema: { type: "string" },
+              render: (_args, value) => [{ type: "text", text: value }],
+            },
+            execute(args) {
+              return spec.execute(args ?? {});
+            },
+          });
+        }
+      };
+      if (defer <= 0) return doRegister();
+      const timer = setTimeout(() => {
+        try {
+          doRegister();
+        } catch (e) {
+          const msg = String(e?.message || e);
+          if (ctx.logger?.warn) ctx.logger.warn(`hindsight: 延迟注册工具失败: ${msg.length > 120 ? msg.slice(0, 120) + "…" : msg}`);
+        }
+      }, defer);
+      timer.unref?.();
     });
   }
 }

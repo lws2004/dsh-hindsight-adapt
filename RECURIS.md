@@ -149,6 +149,12 @@ config:
   auditEnabled: true         # ledger 提案审计(diff+接受/拒绝+门控, 防重复提议)
   # P4a: TTA 携带卡 —— 会话内有失败标记时 pre-step 注入命中卡(重试携带教训)
   ttaInjectEnabled: true
+  # P7: 工具归属缓解(dsh-context 上下文面板"未知插件"标签)
+  #   原因: dsh-context 对其 attribution hook 安装前注册的工具标"未知插件"
+  #   (第三方 file:// 插件普遍如此, 功能不受影响)。toolsDeferMs>0 时把工具
+  #   注册延后 defer 毫秒, 给它先装 hook 的机会(live 归因 → 显示插件名);
+  #   有超时兜底必注册。设 0 恢复实时注册(面板标签回"未知插件")。
+  toolsDeferMs: 50
   root: /Users/lanws/.dsh/storages/recuris
 ```
 
@@ -213,6 +219,21 @@ config:
 - **反直觉经验(已固化全局)**: 知识库只给"演化器"读, 不注入"执行器"上下文——执行时直接抄知识
   会让轨迹失去信息量(论文消融: 注入反而降质); 技能可跨模型/agent 迁移, 小 agent 带技能可超越
   大 agent 无技能。
+
+## P7(工具归属: dsh-context 面板"未知插件"与缓解)
+
+上下文面板(第三方 `dsh-context` 插件)给每个工具标来源插件。它对"其 attribution hook
+安装**之前**注册"的工具统一显示**未知插件**——不是错误, 属该插件的设计行为:
+
+- **机制**: dsh-context `inject: ["sessionProjections"]`, 服务就绪后才 apply 并安装
+  `ownerOf` hook; 它通过监听 `internal/get` 包装 `tools.register` 做 live 归因。
+  `file://` 挂载的插件(hindsight/recuris)尽早注册 → 落入它的 **boot 快照** →
+  `<unknown-plugin>`。同理所有 home 层/file:// 插件(如 dsh-file-claim 类)都这样。
+- **功能无影响**: 工具本身可用; 仅是上下文面板的归属标签不显示。
+- **缓解(`toolsDeferMs`)**: 默认 50ms —— tools 服务就绪后再延迟 50ms 注册工具,
+  给 dsh-context 先装 hook 的机会; 命中 live 归因后标签显示插件名。有超时兜底,
+  **必注册, 不会丢工具**。设 `0` 恢复立即注册(标签回"未知插件")。
+- **彻底修复**需改 dsh-context 自身(如把本地插件名加进其 pinned 表), 与本插件无关。
 
 ## 成本—收益总览(2026-08-31)
 

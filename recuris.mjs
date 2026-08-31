@@ -75,11 +75,18 @@ const DEFAULTS = {
   ttaInjectEnabled: true,        // 失败经验卡自动注入(重试即有卡可用)
   // P5: 卡 → SKILL.md 全局技能(本机所有 agent 会话按需可加载的最终固化形态)
   exportRoot: join(homedir(), ".agents", "skills"),
+  // P7: 工具归属(dsh-context 面板为何显示"未知插件"的可选缓解)
+  //   dsh-context 的 ownerOf 对"其 hook 安装前注册"的工具标 unknown。
+  //   原理: 它 inject sessionProjections(服务就绪后 apply 装 hook), 我们的插件
+  //   尽早注册, 落入它的 boot 快照。toolsDeferMs>0 时把工具注册延后到微任务+
+  //   超时之后, 让 dsh-context 有机会先装 attribution hook(live 归因 → 面板
+  //   显示插件名)。默认 50ms 有超时兜底必注册; 设 0 = 立即(面板仍显"未知插件")。
+  toolsDeferMs: 50,
 };
 
 function resolveConfig(cfg) {
   const c = { ...DEFAULTS, ...(cfg || {}) };
-  for (const k of ["diagnosisWorkers", "regCap", "evolveTimeoutMs", "autoEvolveMinTurns", "autoEvolveCoolDownMs", "evidenceTrajectoryTurns", "evidenceFailures", "evidenceSkills", "replayHeldOutTasks", "patternsMax"]) {
+  for (const k of ["diagnosisWorkers", "regCap", "evolveTimeoutMs", "autoEvolveMinTurns", "autoEvolveCoolDownMs", "evidenceTrajectoryTurns", "evidenceFailures", "evidenceSkills", "replayHeldOutTasks", "patternsMax", "toolsDeferMs"]) {
     const n = Number(c[k]);
     c[k] = Number.isFinite(n) && n >= 0 ? n : DEFAULTS[k];
   }
@@ -1797,7 +1804,20 @@ export function apply(ctx, config) {
         });
       }
     };
-    ctx.inject(["tools"], registerTools);
+    // P7 归属缓解(可选): tools 就绪后仍延迟 deferMs 再注册, 给 dsh-context
+    // (inject sessionProjections) 先装 attribution hook 的机会; 超时兜底必注册。
+    const defer = Math.max(0, Number(cfg.toolsDeferMs) || 0);
+    ctx.inject(["tools"], (tc) => {
+      if (defer <= 0) return registerTools(tc);
+      const timer = setTimeout(() => {
+        try {
+          registerTools(tc);
+        } catch (e) {
+          if (ctx.logger?.warn) ctx.logger.warn(`recuris: 延迟注册工具失败: ${trimText(String(e?.message || e), 120)}`);
+        }
+      }, defer);
+      timer.unref?.();
+    });
     const existingTools = ctx.get("tools");
     if (existingTools) registerTools({ tools: existingTools });
   }
