@@ -345,6 +345,12 @@ assert.ok(attached.rejected.includes("错误方案"), "attachPersistentKnowledge
 const p6dir = mod.__test.pathsOf(cfg);
 const cardDetailView = mod.__test?.renderSkillCardText ? mod.__test.renderSkillCardText(cardAfterEvolve) : "";
 assert.ok(cardDetailView.includes("源自持久模式"), "卡文本应含 PURPOSE 追溯");
+// 12g. 模式 id 为 ASCII+hash(安全落盘, 中文名不撞文件)且同一名字跨迭代稳定
+const idA = rel6.patternIdOf("补丁验证先看基线");
+assert.ok(/^pat-[a-z0-9-]+-[0-9a-f]{8}$/.test(idA), "id 应 ASCII 安全: " + idA);
+assert.equal(rel6.patternIdOf("补丁验证先看基线"), idA, "同模式名应生成稳定 id");
+assert.notEqual(rel6.patternIdOf("网络超时重试策略"), idA, "不同模式名应生成不同 id");
+assert.ok(!idA.includes("_"), "id 不应含下划线(直接可作文件名)");
 
 console.log("✅ 冒烟测试全部通过");
 console.log("   runId:", result.runId);

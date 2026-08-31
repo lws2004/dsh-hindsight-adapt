@@ -24,7 +24,7 @@
 // 单独挂载(recuris-adapt 行), 可独立开关。所有钩子静默降级, 绝不阻断对话。
 // ═══════════════════════════════════════════════════════════════════
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, appendFileSync } from "node:fs";
@@ -127,7 +127,7 @@ function pathsOf(cfg) {
   };
 }
 function ensureDirs(p) {
-  for (const d of [p.root, p.traces, p.wm, p.skills, p.evolutions]) {
+  for (const d of [p.root, p.traces, p.wm, p.skills, p.patterns, p.evolutions]) {
     try {
       mkdirSync(d, { recursive: true });
     } catch {
@@ -615,9 +615,16 @@ function listPatterns(p) {
 function readPattern(p, id) {
   return readJson(patternFile(p, id), null);
 }
-/** 模式名 → 稳定 id */
+/** 模式名 → 稳定 id: ASCII slug + 短 hash, 保证唯一且落盘安全(中文名也不撞文件) */
 function patternIdOf(name) {
-  return "pat-" + slugify(name || "pattern", "pattern").slice(0, 40);
+  const raw = String(name || "pattern");
+  const ascii = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24) || "pattern";
+  const h = createHash("sha1").update(raw).digest("hex").slice(0, 8);
+  return `pat-${ascii}-${h}`;
 }
 /**
  * 落盘/合并一条模式(Wiki 永不回滚: 只增不删; 同名近似合并, 追加证据)。
@@ -1721,6 +1728,7 @@ export const __test = {
   runWikiMaintainer,
   listPatterns,
   readPattern,
+  patternIdOf,
   upsertPattern,
   storePatterns,
   renderWiki,

@@ -33,6 +33,9 @@
 
 ## 存储布局(默认 `~/.dsh/storages/recuris/`)
 
+> 原则: **插件只有这一个存储根**(`root` 配置可整体搬移), 所有产物均为其子目录,
+> 无任何独立存储目录, 便于整体备份/清理/迁移。
+
 ```
 trajectories/<sessionId>.jsonl   逐 turn: {t, ts, w(goal摘要), user, actions[], assistant, fail, error}
 wm/<sessionId>.json              工作记忆卡(目标/阶段/进度/阻塞/最近动作)
