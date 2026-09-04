@@ -42,6 +42,9 @@ const DEFAULTS = {
   traceEnabled: true,            // P0 轨迹记录
   wmEnabled: true,               // P1 工作记忆卡
   injectWmEnabled: true,         // pre-step 注入 WM(状态接地)
+  // P0 跨会话上下文注入(session-start 时读取近 7 天 WM + 技能卡召回, pre-step step1 注入)。
+  // 2026-09-04: 新增开关便于 A/B(怀疑其阻塞"点新会话"); false=完全跳过该链路(不含 hs 调用)
+  sessionStartContextEnabled: true,
   toolsEnabled: true,            // recuris_* 工具
   metaProvider: "opencode-go",   // 上游 meta 模型(≠ 下游 worker)
   metaModel: "deepseek-v4-pro",
@@ -1742,7 +1745,7 @@ function createHooks(ctx, cfg) {
       const sessionId = sessionOf(agent);
       if (sessionId) {
         liveAgents.set(sessionId, agent);
-        seedRecurisContext(cfg, sessionId);
+        if (cfg.sessionStartContextEnabled) seedRecurisContext(cfg, sessionId);
       }
     },
     async preStep({ agent, signal, step, turn }, next) {
