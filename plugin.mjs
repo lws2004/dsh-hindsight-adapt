@@ -77,9 +77,10 @@ const DEFAULTS = {
   sessionStartRecallGenericMode: "skip",
   sessionStartRecallGenericMax: 2,      // 泛化时最多注入条数(tighten 模式用)
   sessionStartRecallGenericMinScore: 0.5, // 泛化时最低相似度(tighten 模式用)
-  // P9: 并行召回兜底 —— 召回与模型 TTFT 同时跑(实测 recall 3.5s < TTFT 9s, 正常必命中);
-  // next() 返回后最多等 graceMs, 超时放弃注入(绝不阻塞首条消息)
-  sessionStartRecallGraceMs: 800,
+  // P9/P9a: 并行召回 —— inboxClaimed(消息 claim)即 fire recall, 与上下文组装/模型 TTFT 并行;
+  // pre-step 只读结果(兜底从 payload.messages 取消息); next() 后最多等 graceMs,
+  // 超时放弃注入(宁缺毋滥, 阻塞预算 = grace, 用户无感优先; 需要稳定注入可调大 grace)
+  sessionStartRecallGraceMs: 1500,
 };
 
 function resolveConfig(cfg) {
@@ -441,16 +442,27 @@ function createHooks(ctx, cfg) {
         seedSessionContext(cfg, sessionId);
       }
     },
-    async preStep({ agent, signal, step, turn }, next) {
+    // P9a: 最早 fire 点 —— inbox claim(用户消息进入 turn)时即启动广谱召回, 与
+    // 上下文组装/模型 TTFT 并行; pre-step 只读结果(窗口最大化, 零阻塞)。
+    inboxClaimed({ agent, message, turn }) {
       const sessionId = agent?.session?.header?.id;
-      // P9: 广谱召回与模型调用并行 —— await next()(模型 TTFT)之前 fire recall(不阻塞);
-      // next() 返回后若 recall 已就绪(实测 3.5s < TTFT ~9s, 正常必命中)则注入,
-      // 超 grace 则放弃(宁缺毋滥, 绝不让召回拖慢首条消息)。
+      if (!sessionId || turn !== 1 || sessionStartRecalls.has(sessionId)) return;
+      const text = stripInjectedMemory(textOf(message)).trim();
+      if (!text || text.length < 4) return;
+      // 存 promise; 泛化/空结果(null)也标记, 避免 pre-step 兜底重试
+      sessionStartRecalls.set(sessionId, doSessionStartRecall(cfg, sessionId, text) ?? true);
+    },
+    async preStep({ agent, signal, step, turn, messages }, next) {
+      const sessionId = agent?.session?.header?.id;
+      // P9: 读取召回结果: 优先用 inboxClaimed 预取的 promise; 若未触发(事件缺失/非 turn1),
+      // 从 payload.messages 兜底 fire(真实并行于 next 的组装)。
       let recallPromise = null;
-      if (sessionId && !sessionStartRecalls.has(sessionId)) {
-        sessionStartRecalls.set(sessionId, true); // 每 session 只尝试一次
-        if (step === undefined || step === 1) {
-          const q = firstUserMessageOf(agent);
+      if (sessionId) {
+        const held = sessionStartRecalls.get(sessionId);
+        if (held instanceof Promise) recallPromise = held;
+        else if (!held && (step === undefined || step === 1)) {
+          sessionStartRecalls.set(sessionId, true); // 兜底: 每 session 只尝试一次
+          const q = promptOf(messages);
           if (q && q.trim().length >= 4) recallPromise = doSessionStartRecall(cfg, sessionId, q.trim());
         }
       }
@@ -584,6 +596,7 @@ export function apply(ctx, config) {
   if (!cfg.enabled) return () => undefined;
   const hooks = createHooks(ctx, cfg);
   ctx.on("agent/session-start", hooks.sessionStart);
+  ctx.on("agent/inbox/claimed", hooks.inboxClaimed, { prepend: true });
   ctx.on("agent/pre-step", hooks.preStep, { prepend: true });
   ctx.on("agent/turn-stopping", hooks.turnStopping);
   ctx.on("agent/disposed", hooks.disposed);
