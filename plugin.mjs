@@ -68,7 +68,7 @@ const DEFAULTS = {
   sessionStartRecall: false,    // 是否启用 session-start 广谱召回
   sessionStartRecallMax: 3,     // 最多注入条数(降噪, 宁缺毋滥)
   sessionStartRecallTimeoutMs: 15000, // 召回超时
-  sessionStartRecallScope: "current", // 检索范围: current|global|all(默认 current 减少跨项目噪声)
+  sessionStartRecallScope: "current", // 检索范围: current|global(2026-09-04 起禁用 all: 跨库合并检索实测 ~14s, 见 doSessionStartRecall)
   sessionStartRecallMinScore: 0.5, // 最低相似度阈值(2026-09-04 由 0.35 上调): 宁缺毋滥, 允许空——
   // 原则: 无相关记忆时召回空是正常结果, 不为凑数兜底抬出弱相关条目(0.35 实测混入主题错配噪声)
   // P8: 泛化首条消息(无明确领域/疑问, 如"推荐一部好看的科幻电影")召回噪声大且价值低:
@@ -315,12 +315,12 @@ const toolRetain = {
 const toolRecall = {
   name: "hindsight_recall",
   description:
-    "语义搜索 Hindsight 记忆(经共享 CLI hs-memory, 自动多库合并并标注来源 [库名])。默认: 当前解析库 + coding-agent::global 合并(非 git 时即 global)。bankId: repo(仅项目库)/global(仅全局库)/all(全合并含感知到的其他 agent 库,只读)/显式库名。factTypes: observation(默认,整合观察优先,自动去重不重复)/world(只要原始事实)/both(原始事实+observation 并列全取)/skill(只要结晶指令块)。适合: 用户提到以前聊过的事、需要历史经验/踩坑记录。",
+    "语义搜索 Hindsight 记忆(经共享 CLI hs-memory, 自动多库合并并标注来源 [库名])。默认: 当前解析库 + coding-agent::global 合并(非 git 时即 global)。bankId: repo(仅项目库)/global(仅全局库)/显式库名(如 hermes)。factTypes: observation(默认,整合观察优先,自动去重不重复)/world(只要原始事实)/both(原始事实+observation 并列全取)/skill(只要结晶指令块)。适合: 用户提到以前聊过的事、需要历史经验/踩坑记录。注: 跨所有感知库全合并(--scope all)实测 ~14s, 已禁用。",
   parameters: {
     type: "object",
     properties: {
       query: { type: "string", description: "自然语言查询" },
-      bankId: { type: "string", description: "检索范围: 默认合并; repo=项目库; global=全局库; all=全合并; 或显式库名(如 hermes)" },
+      bankId: { type: "string", description: "检索范围: 默认合并(当前库+global); repo=项目库; global=全局库; 或显式库名(如 hermes)。(all 全合并已禁用: ~14s 慢查询)" },
       factTypes: { type: "string", enum: ["observation", "world", "both", "skill"], description: "记忆类型选择(默认 observation): observation=只取整合观察(去重); world=只要原始事实; both=原始事实与 observation 并列全取; skill=只要结晶指令块。" },
     },
   },
@@ -329,10 +329,10 @@ const toolRecall = {
     if (!q) return "缺少 query。";
     const argv = ["recall", q];
     const want = String(args?.bankId ?? "");
+    // 2026-09-04: all(全库合并)实测 ~14s, 禁用 —— 视为默认(当前库+global 合并, 快), 不再产生 --scope all
     if (want === "repo") argv.push("--scope", "project");
     else if (want === "global") argv.push("--scope", "global");
-    else if (want === "all") argv.push("--scope", "all");
-    else if (want) argv.push("--bank", want);
+    else if (want && want !== "all") argv.push("--bank", want);
     const ft = String(args?.factTypes ?? "observation").toLowerCase();
     if (ft === "world") argv.push("--types", "world,experience", "--prefer-obs", "false");
     else if (ft === "both") argv.push("--types", "world,experience,observation", "--prefer-obs", "false");
@@ -422,9 +422,10 @@ async function doSessionStartRecall(cfg, sessionId, userMessage) {
   if (generic && cfg.sessionStartRecallGenericMode === "skip") return null; // 泛化意义不大: 不召回
   const argv = ["recall", q];
   const scope = cfg.sessionStartRecallScope;
-  if (scope === "current") argv.push("--scope", "project");
-  else if (scope === "global") argv.push("--scope", "global");
-  else argv.push("--scope", "all");
+  // 2026-09-04: 禁用 --scope all(跨库合并检索实测稳定 ~14s, session-start/hs 链路阻塞)。
+  // 仅支持 current(单项目库 ~0.2s)与 global; 显式配 all 降级为 project, 不再产生慢查询。
+  if (scope === "global") argv.push("--scope", "global");
+  else argv.push("--scope", "project");
   argv.push("--types", "observation");
   argv.push("--top", String(generic ? cfg.sessionStartRecallGenericMax : cfg.sessionStartRecallMax));
   argv.push("--min-score", String(generic ? cfg.sessionStartRecallGenericMinScore : cfg.sessionStartRecallMinScore));
