@@ -64,15 +64,33 @@ const DEFAULTS = {
   toolsEnabled: true,           // 注册 hindsight_* 工具
   // P7: 工具归属缓解(dsh-context 面板"未知插件")——注册延后给 attribution hook 让路
   toolsDeferMs: 50,             // tools 就绪后再等 N ms 注册(0=立即)
+  // Layer 1: 会话启动广谱召回(动态查询: 用首条用户消息做 recall query)
+  sessionStartRecall: false,    // 是否启用 session-start 广谱召回
+  sessionStartRecallMax: 3,     // 最多注入条数(降噪, 宁缺毋滥)
+  sessionStartRecallTimeoutMs: 15000, // 召回超时
+  sessionStartRecallScope: "current", // 检索范围: current|global|all(默认 current 减少跨项目噪声)
+  sessionStartRecallMinScore: 0.5, // 最低相似度阈值(2026-09-04 由 0.35 上调): 宁缺毋滥, 允许空——
+  // 原则: 无相关记忆时召回空是正常结果, 不为凑数兜底抬出弱相关条目(0.35 实测混入主题错配噪声)
+  // P8: 泛化首条消息(无明确领域/疑问, 如"推荐一部好看的科幻电影")召回噪声大且价值低:
+  //   实测 min-score 提高到 0.5 仍拦不住主题错配(服务端阈值语义宽松), 仅减量降噪有限;
+  //   skip(默认): 泛化直接不召回(最彻底); tighten: 保留高阈值+减量(仍可能混入噪声)
+  sessionStartRecallGenericMode: "skip",
+  sessionStartRecallGenericMax: 2,      // 泛化时最多注入条数(tighten 模式用)
+  sessionStartRecallGenericMinScore: 0.5, // 泛化时最低相似度(tighten 模式用)
+  // P9: 并行召回兜底 —— 召回与模型 TTFT 同时跑(实测 recall 3.5s < TTFT 9s, 正常必命中);
+  // next() 返回后最多等 graceMs, 超时放弃注入(绝不阻塞首条消息)
+  sessionStartRecallGraceMs: 800,
 };
 
 function resolveConfig(cfg) {
   const c = { ...DEFAULTS, ...(cfg || {}) };
-  for (const k of ["curateEveryN", "maxBufferChars", "curateTimeoutMs", "injectTimeoutMs", "consolidateEveryNCurate", "crystallizeEveryNCurate", "toolsDeferMs"]) {
+  for (const k of ["curateEveryN", "maxBufferChars", "curateTimeoutMs", "injectTimeoutMs", "consolidateEveryNCurate", "crystallizeEveryNCurate", "toolsDeferMs", "sessionStartRecallMax", "sessionStartRecallTimeoutMs", "sessionStartRecallMinScore", "sessionStartRecallGenericMax", "sessionStartRecallGenericMinScore", "sessionStartRecallGraceMs"]) {
     const n = Number(c[k]);
     c[k] = Number.isFinite(n) && n >= 0 ? n : DEFAULTS[k];
   }
-  for (const k of ["enabled", "injectEnabled", "curateEnabled", "toolsEnabled"]) c[k] = c[k] !== false;
+  for (const k of ["enabled", "injectEnabled", "curateEnabled", "toolsEnabled", "sessionStartRecall"]) c[k] = c[k] !== false;
+  c.sessionStartRecallScope = String(c.sessionStartRecallScope || DEFAULTS.sessionStartRecallScope);
+  c.sessionStartRecallGenericMode = ["tighten", "skip"].includes(c.sessionStartRecallGenericMode) ? c.sessionStartRecallGenericMode : DEFAULTS.sessionStartRecallGenericMode;
   return c;
 }
 
@@ -173,6 +191,13 @@ function readDshEvents(events) {
   return turns;
 }
 
+// 从 agent session events 取首条用户消息(P9: 并行召回用, 不等模型调用)
+function firstUserMessageOf(agent) {
+  const turns = readDshEvents(agent?.session?.events);
+  for (const t of turns) if (t.role === "user") return t.content;
+  return null;
+}
+
 // ── 会话内状态 ──
 // buffers: sessionId -> { turns: [{user, assistant, actions[]}], processed, pending[], curateCount }
 // pending item: { turns, transcript, retries, kind: 'regular'|'evict' }
@@ -180,6 +205,7 @@ const liveAgents = new Map(); // sessionId -> agent
 const buffers = new Map();
 const retryCounts = new Map(); // transcript -> 连续失败次数(批次重建后仍延续)
 const injectedTurns = new WeakMap(); // agent -> turn(同 turn 只注入一次)
+const sessionStartRecalls = new Map(); // sessionId -> 广谱召回结果(待 preStep 注入)
 
 // ── 注入消息(与 dsh.js 同形, 插件来源标记 form=recall) ──
 function injectionMessage(text) {
@@ -360,41 +386,115 @@ const toolStatus = {
 
 const TOOLS = [toolRetain, toolRecall, toolReflect, toolStatus];
 
+// ── Layer 1: 会话启动广谱召回(动态查询版) ──
+// P0 优化: 不再用固定 prompt "recent project work decisions progress context",
+// 改为在 preStep 中用用户首条消息作为 recall query, 大幅提升精度。
+// seedSessionContext 改为 no-op(保留函数签名兼容, 实际召回逻辑移至 doSessionStartRecall)。
+function seedSessionContext(_cfg, _sessionId) {
+  // no-op: 召回延迟到 preStep, 用用户首条消息做动态查询
+}
+
+// ── 泛化首条消息判定(P8: 实测"推荐一部科幻电影"等泛化查询召回全噪声) ──
+// 命中任一 → 具体: 疑问词(有明确关心点) / 领域实体(技术词/专名/文件扩展名)
+// 否则剥壳(通用引导词+不定量词)后剩余信息量不足(中文 <8 字符) → 泛化
+const GENERIC_PREFIX_RE = /^(?:请|麻烦|帮我|帮忙|给我|帮我写|帮我做|帮我弄|帮我找|帮我查|帮我看看|搜索|搜一下|找一下|查一下|看一下|看看|推荐|介绍|解释|写个?|做个?|建个?|创建|新建|生成|弄个?|搞定|tell\s+me|help(?:\s+me)?|please\b|write\b|create\b|make\b|search\b|find\b|recommend\b|explain\b|show\s+me\b|how\s+(?:do|to)\b|what\s+(?:is|are)\b|i\s+(?:want|need)(?:\s+to)?\b)[\s:：,，]*/i;
+const GENERIC_QUANT_RE = /^(?:一个|一部|一些|一份|几个|个|点|一下)[\s:：,，]*/;
+const DOMAIN_TOKEN_RE = /(?:[A-Za-z][A-Za-z0-9_.-]*\.(?:py|ts|js|mjs|cjs|json|jsonl|sh|bash|zsh|md|mdx|yml|yaml|csv|tsv|txt|html?|css|sql|toml|ini|env|lock|log|pdf|docx?|xlsx?|pptx?))\b|(?:hindsight|recuris|feishu|lark|git(?:hub)?|docker|k8s|kubernetes|uv|python|nodejs?|bun|npm|pnpm|yarn|dsh|plugin|skill|agent|prompt|api|http|web|cli|shell|curl|paraformer|qwen|mlx|memory|session|recall|retain|curate|inject|consolidate|bank|飞书|妙搭|记忆库|技能卡|插件|召回)/i;
+const QUESTION_TOKEN_RE = /(?:怎样|如何|为什么|怎么|哪些|哪[一种个]|什么|是否|啥|吗$|呢$|why|how|what|where|which|when|is\b|are\b|does\b)/i;
+function isGenericQuery(msg) {
+  const s = String(msg ?? "").trim();
+  if (!s) return true;
+  if (QUESTION_TOKEN_RE.test(s)) return false; // 疑问 → 有明确关心点
+  if (DOMAIN_TOKEN_RE.test(s)) return false;   // 领域实体 → 具体
+  const stripped = s.replace(GENERIC_PREFIX_RE, "").replace(GENERIC_QUANT_RE, "").trim();
+  return stripped.length < 8;                  // 剥壳后信息量不足 → 泛化
+}
+
+// 动态查询: 用用户首条消息做 recall query + 分数阈值过滤
+// P8: 泛化查询收紧/跳过(泛化消息对广谱召回价值低, 噪声大)
+async function doSessionStartRecall(cfg, sessionId, userMessage) {
+  if (!cfg.sessionStartRecall) return null;
+  if (!userMessage || userMessage.trim().length < 4) return null; // 太短的消息不查
+  const q = userMessage.trim();
+  const generic = isGenericQuery(q);
+  if (generic && cfg.sessionStartRecallGenericMode === "skip") return null; // 泛化意义不大: 不召回
+  const argv = ["recall", q];
+  const scope = cfg.sessionStartRecallScope;
+  if (scope === "current") argv.push("--scope", "project");
+  else if (scope === "global") argv.push("--scope", "global");
+  else argv.push("--scope", "all");
+  argv.push("--types", "observation");
+  argv.push("--top", String(generic ? cfg.sessionStartRecallGenericMax : cfg.sessionStartRecallMax));
+  argv.push("--min-score", String(generic ? cfg.sessionStartRecallGenericMinScore : cfg.sessionStartRecallMinScore));
+  const r = await hsMemoryAsync(argv, cfg.sessionStartRecallTimeoutMs);
+  if (r.ok && r.out && r.out.trim()) return r.out.trim();
+  return null;
+}
+
 // ── 会话钩子 ──
 function createHooks(ctx, cfg) {
   return {
     sessionStart({ agent }) {
       const sessionId = agent?.session?.header?.id;
-      if (sessionId) liveAgents.set(sessionId, agent);
+      if (sessionId) {
+        liveAgents.set(sessionId, agent);
+        seedSessionContext(cfg, sessionId);
+      }
     },
     async preStep({ agent, signal, step, turn }, next) {
+      const sessionId = agent?.session?.header?.id;
+      // P9: 广谱召回与模型调用并行 —— await next()(模型 TTFT)之前 fire recall(不阻塞);
+      // next() 返回后若 recall 已就绪(实测 3.5s < TTFT ~9s, 正常必命中)则注入,
+      // 超 grace 则放弃(宁缺毋滥, 绝不让召回拖慢首条消息)。
+      let recallPromise = null;
+      if (sessionId && !sessionStartRecalls.has(sessionId)) {
+        sessionStartRecalls.set(sessionId, true); // 每 session 只尝试一次
+        if (step === undefined || step === 1) {
+          const q = firstUserMessageOf(agent);
+          if (q && q.trim().length >= 4) recallPromise = doSessionStartRecall(cfg, sessionId, q.trim());
+        }
+      }
       const decision = await next();
       if (decision?.kind !== "enter" || signal?.aborted) return decision;
-      if (!cfg.injectEnabled) return decision;
       // 仅主步骤注入, 递归/子代理步骤不重复检索(对齐 memos-remote)
       if (typeof step === "number" && step !== 1) return decision;
-      const sessionId = agent?.session?.header?.id;
       if (!sessionId) return decision;
       liveAgents.set(sessionId, agent);
-      // 同一 turn 只尝试注入一次(WeakMap 按 turn 记录, 新 turn 重新允许)
-      if (injectedTurns.get(agent) === turn) return decision;
-      const prompt = promptOf(decision.messages);
-      if (!prompt) return decision;
-      try {
-        const r = await hsMemoryAsync(["inject", prompt], cfg.injectTimeoutMs);
-        if (!r.ok || !r.out) return decision;
-        injectedTurns.set(agent, turn);
-        const block = r.out
-          .split("\n")
-          .filter(Boolean)
-          .slice(0, 8)
-          .map((t, i) => `[记忆${i + 1}] ${t}`)
-          .join("\n");
-        const text = "## 相关长期记忆(Hindsight, 仅供参考, 若与当前事实冲突以当前为准)\n" + block;
-        return { kind: "enter", messages: [...decision.messages, injectionMessage(text)] };
-      } catch {
-        return decision; // 静默失败, 绝不阻断对话
+      const blocks = [];
+      // Layer 1: 会话启动广谱召回(并行结果): 已就绪才注入, 超时放弃(空是正常结果)
+      if (recallPromise) {
+        const graceful = new Promise((r) => setTimeout(() => r(null), cfg.sessionStartRecallGraceMs));
+        const startRecall = await Promise.race([recallPromise, graceful]);
+        if (startRecall) {
+          blocks.push("## 最近项目上下文(Hindsight, 仅供参考)\n" + startRecall);
+        }
       }
+      // Layer 2: prompt-based inject(仅 injectEnabled 时)
+      if (cfg.injectEnabled) {
+        // 同一 turn 只尝试注入一次(WeakMap 按 turn 记录, 新 turn 重新允许)
+        if (injectedTurns.get(agent) === turn) return decision;
+        const prompt = promptOf(decision.messages);
+        if (!prompt) return decision;
+        try {
+          const r = await hsMemoryAsync(["inject", prompt], cfg.injectTimeoutMs);
+          if (r.ok && r.out) {
+            injectedTurns.set(agent, turn);
+            const block = r.out
+              .split("\n")
+              .filter(Boolean)
+              .slice(0, 8)
+              .map((t, i) => `[记忆${i + 1}] ${t}`)
+              .join("\n");
+            blocks.push("## 相关长期记忆(Hindsight, 仅供参考, 若与当前事实冲突以当前为准)\n" + block);
+          }
+        } catch {
+          // 静默失败
+        }
+      }
+      if (blocks.length) {
+        return { kind: "enter", messages: [...decision.messages, injectionMessage(blocks.join("\n\n"))] };
+      }
+      return decision;
     },
     turnStopping({ agent }) {
       const sessionId = agent?.session?.header?.id;
@@ -457,6 +557,7 @@ function createHooks(ctx, cfg) {
       const sessionId = agent?.session?.header?.id;
       if (!sessionId) return;
       liveAgents.delete(sessionId);
+      sessionStartRecalls.delete(sessionId);
       const st = buffers.get(sessionId);
       buffers.delete(sessionId);
       try {
