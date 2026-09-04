@@ -571,9 +571,12 @@ function seedRecurisContext(cfg, sessionId) {
       result.wm = lines.join("\n");
     }
     // P2: 查询技能卡(从 Hindsight 召回)
+    // 2026-09-04 性能修复: 原 --scope all(跨 7 库合并检索)实测稳定 ~14s, 且位于
+    // sessionStart 钩子内同步阻塞(execFileSync)→ 每次新会话创建卡 14s, Web 事件循环冻结。
+    // 改 --scope project(单项目库, 实测 ~0.24s), 语义对齐 plugin.mjs sessionStartRecallScope: current。
     try {
-      const hsOut = execFileSync("bash", [HS_MEMORY, "recall", "project skill lessons learned", "--scope", "all", "--types", "skill", "--top", "3"], {
-        env: HS_ENV, encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"],
+      const hsOut = execFileSync("bash", [HS_MEMORY, "recall", "project skill lessons learned", "--scope", "project", "--types", "skill", "--top", "3"], {
+        env: HS_ENV, encoding: "utf8", timeout: 8000, stdio: ["ignore", "pipe", "pipe"],
       });
       if (hsOut && hsOut.trim()) {
         result.skills = "## 相关技能卡(Recuris)\n" + hsOut.trim().split("\n").filter(Boolean).slice(0, 3).map((l, i) => `[技能${i + 1}] ${l}`).join("\n");

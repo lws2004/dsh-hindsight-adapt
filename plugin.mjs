@@ -80,7 +80,8 @@ const DEFAULTS = {
   // P9/P9a: 并行召回 —— inboxClaimed(消息 claim)即 fire recall, 与上下文组装/模型 TTFT 并行;
   // pre-step 只读结果(兜底从 payload.messages 取消息); next() 后最多等 graceMs,
   // 超时放弃注入(宁缺毋滥, 阻塞预算 = grace, 用户无感优先; 需要稳定注入可调大 grace)
-  sessionStartRecallGraceMs: 1500,
+  // 2026-09-04: 800→1500 未带来收益(scope project 召回 ~0.24s, 远小于 grace), 调回 800 收紧阻塞预算
+  sessionStartRecallGraceMs: 800,
 };
 
 function resolveConfig(cfg) {
