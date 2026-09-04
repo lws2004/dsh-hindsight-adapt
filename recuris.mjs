@@ -530,6 +530,65 @@ function ttaBlockFor(p, sessionId) {
   }
 }
 
+// ── P0: 跨会话 WM 注入 —— 读取最近会话的工作记忆, 为新会话提供上下文 ──
+function seedRecurisContext(cfg, sessionId) {
+  try {
+    const p = pathsOf(cfg);
+    const result = { wm: null, skills: null };
+    // 读取最近 7 天的 WM 文件(排除当前会话)
+    const now = Date.now();
+    const weekMs = 7 * 24 * 60 * 60 * 1000;
+    const recentWm = [];
+    if (existsSync(p.wm)) {
+      for (const f of readdirSync(p.wm)) {
+        if (!f.endsWith(".json") || f.includes(safeName(sessionId))) continue;
+        const file = join(p.wm, f);
+        try {
+          const wm = JSON.parse(readFileSync(file, "utf8"));
+          const ts = new Date(wm.ts || 0).getTime();
+          if (now - ts > weekMs) continue;
+          if (wm.turnCount > 0 && (wm.recent?.length || wm.goal)) {
+            recentWm.push(wm);
+          }
+        } catch {
+          // 跳过损坏的文件
+        }
+      }
+    }
+    // 取最近 5 个会话, 每个取最近 2 轮
+    if (recentWm.length) {
+      recentWm.sort((a, b) => new Date(b.ts || 0) - new Date(a.ts || 0));
+      const lines = ["## 最近会话上下文(Recuris 工作记忆)"];
+      for (const wm of recentWm.slice(0, 5)) {
+        const lastTurns = (wm.recent || []).slice(-2);
+        const goalStr = wm.goal?.objective || "";
+        if (goalStr) lines.push(`目标: ${goalStr}`);
+        for (const t of lastTurns) {
+          const user = (t.user || "").slice(0, 80);
+          if (user) lines.push(`  - ${user}`);
+        }
+      }
+      result.wm = lines.join("\n");
+    }
+    // P2: 查询技能卡(从 Hindsight 召回)
+    try {
+      const hsOut = execFileSync("bash", [HS_MEMORY, "recall", "project skill lessons learned", "--scope", "all", "--types", "skill", "--top", "3"], {
+        env: HS_ENV, encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (hsOut && hsOut.trim()) {
+        result.skills = "## 相关技能卡(Recuris)\n" + hsOut.trim().split("\n").filter(Boolean).slice(0, 3).map((l, i) => `[技能${i + 1}] ${l}`).join("\n");
+      }
+    } catch {
+      // Hindsight 不可用时静默
+    }
+    if (result.wm || result.skills) {
+      sessionStartContexts.set(sessionId, result);
+    }
+  } catch {
+    // 静默失败
+  }
+}
+
 // ── P3b 回放式门控: 候选卡在"留出失败任务轨迹"上做确定性回放 ──
 const ACTION_KEYWORDS = ["bash", "edit", "read", "write", "rg", "grep", "fd", "find", "fetch", "search", "skill", "git", "gh", "node", "python", "uv", "pnpm", "bun", "npm", "curl", "memory", "recall", "retain", "docker", "kill", "lsof", "ps", "ls", "cat", "mkdir", "test", "node --check"];
 function cardActionKeywords(card) {
@@ -1635,6 +1694,7 @@ const TOOLS = [toolEvolve, toolWm, toolSkills, toolTrace, toolVerify, toolExport
 const liveAgents = new Map();
 const traceState = new Map();
 const wmInjected = new WeakMap(); // agent -> turn
+const sessionStartContexts = new Map(); // sessionId -> { wm, skills }
 
 // ── 钩子 ──
 function createHooks(ctx, cfg) {
@@ -1677,7 +1737,10 @@ function createHooks(ctx, cfg) {
   return {
     sessionStart({ agent }) {
       const sessionId = sessionOf(agent);
-      if (sessionId) liveAgents.set(sessionId, agent);
+      if (sessionId) {
+        liveAgents.set(sessionId, agent);
+        seedRecurisContext(cfg, sessionId);
+      }
     },
     async preStep({ agent, signal, step, turn }, next) {
       try {
@@ -1686,11 +1749,32 @@ function createHooks(ctx, cfg) {
         if (typeof step === "number" && step !== 1) return decision;
         const sessionId = sessionOf(agent);
         if (!sessionId) return decision;
-        if (wmInjected.get(agent) === turn) return decision;
-        wmInjected.set(agent, turn);
         const blocks = [];
+        // P0: 跨会话 WM + 技能卡(仅 step 1 注入, 独立于 wmInjected)
+        const startCtx = sessionStartContexts.get(sessionId);
+        if (startCtx) {
+          sessionStartContexts.delete(sessionId);
+          if (startCtx.wm) blocks.push(startCtx.wm);
+          if (startCtx.skills) blocks.push(startCtx.skills);
+        }
         // P1: 工作记忆(goal 快照 + manual note + 最近动作)
         if (cfg.injectWmEnabled) {
+          if (wmInjected.get(agent) === turn) {
+            // WM 已注入过, 但可能还有 session-start 内容要注入
+            if (blocks.length) {
+              return {
+                kind: "enter",
+                messages: [...decision.messages, {
+                  id: randomUUID(),
+                  role: "user",
+                  content: [{ type: "text", text: blocks.join("\n\n") }],
+                  source: { kind: "plugin", plugin: name, form: "session-start" },
+                }],
+              };
+            }
+            return decision;
+          }
+          wmInjected.set(agent, turn);
           const goals = ctx.get("goals");
           const goal = goalSnapshot(goals, agent);
           const note = readWmNote(p, sessionId);
@@ -1760,6 +1844,7 @@ function createHooks(ctx, cfg) {
       }
       liveAgents.delete(sessionId);
       traceState.delete(sessionId);
+      sessionStartContexts.delete(sessionId);
     },
   };
 }
