@@ -28,8 +28,15 @@
 //
 // 独立于 @vectorize-io/hindsight-coding-agents(dist 会被插件更新覆盖,
 // 本文件自维护, 更新插件不影响本适配层)。
+//
+// v0.2.1 cwd 修正(2026-09-17): 位置快速路径(git→项目库, 非git→global)由 CLI
+// 子进程按 $(pwd) 解析, 而 DSH harness 进程 cwd 是启动目录(如 ~)而非会话工作
+// 目录 —— 此前所有 CLI 调用(工具/注入/召回/curate/consolidate/crystallize/
+// session-end)都继承了错误 cwd, 默认读写一律错落 global(项目知识检索漏项 +
+// 项目记忆误写入 global)。修法: 全部调用点显式传 cwdOf(agent)
+// (= agent.session.header.cwd, dsh-tool-fs-search 同款取法, 会话内已验证)。
 // ═══════════════════════════════════════════════════════════════════
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -49,6 +56,10 @@ const HS_ENV = {
   HINDSIGHT_INJECT_LIGHT_BANKS: "current,global",
   HINDSIGHT_INJECT_MIN_SCORE: "0.35",
 };
+
+// v0.2.1: 会话工作目录(DSH 已验证的绝对 cwd, dsh-tool-fs-search 同款取法)。
+// CLI 位置快速路径按子进程 pwd 解析库归属, 必须显式传 cwd 修正。
+const cwdOf = (agent) => agent?.session?.header?.cwd || undefined;
 
 // ── 默认配置(cordis.patch.yml 的 config 键可覆盖, 不引入 schemastery 依赖) ──
 const DEFAULTS = {
@@ -96,28 +107,20 @@ function resolveConfig(cfg) {
   return c;
 }
 
-// ── 共享 CLI 封装(同步: 工具用) ──
-function hsMemory(args, timeoutMs = 90000) {
-  try {
-    const out = execFileSync("bash", [HS_MEMORY, ...args], {
-      env: HS_ENV,
-      encoding: "utf8",
-      timeout: timeoutMs,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { ok: true, out: out.trim(), err: "" };
-  } catch (e) {
-    return { ok: false, out: (e?.stdout ?? "").trim(), err: (e?.stderr ?? String(e?.message ?? e)).trim() };
-  }
-}
-
-// ── 异步版: 注入/curate/consolidate/crystallize/收尾用(非阻塞, 绝不卡会话) ──
-function hsMemoryAsync(args, timeoutMs = 30000) {
+// ── 共享 CLI 封装(全部异步) ──
+// v0.2.1: 第三参 cwd —— 会话工作目录(agent.session.header.cwd)。位置快速路径
+// (git→项目库, 非git→global)在 CLI 子进程内用 $(pwd) 解析; DSH harness 进程
+// cwd 是启动目录(如 ~)而非会话工作目录, 不传会导致 读写全部错落 global。
+//
+// 2026-09-15: 工具通道原先走 execFileSync(同步)。它跑在 host 进程里 —— 模型每调
+// 一次 hindsight_*, 整个事件循环(其他会话、websocket、后台 job)就被占住, 最长
+// 90s。工具 execute() 本来就支持返回 Promise, 故统一改为异步(上面的同步封装已删)。
+function hsMemoryAsync(args, timeoutMs = 30000, cwd) {
   return new Promise((resolve) => {
     execFile(
       "bash",
       [HS_MEMORY, ...args],
-      { env: HS_ENV, encoding: "utf8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      { env: HS_ENV, cwd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
       (error, stdout, stderr) => {
         if (error) resolve({ ok: false, out: (stdout ?? "").trim(), err: (stderr ?? String(error.message ?? error)).trim() });
         else resolve({ ok: true, out: (stdout ?? "").trim(), err: "" });
@@ -244,7 +247,8 @@ function renderTranscript(buffer) {
 
 // ── 异步 curate 执行器: 成功→确认+节流触发 consolidate/crystallize; 失败→回滚重试 ──
 async function runCurate(ctx, cfg, sessionId, st, item) {
-  const r = await hsMemoryAsync(["curate", item.transcript], cfg.curateTimeoutMs);
+  // v0.2.1: curate 写路径走位置快速路径, cwd 修正防止项目记忆误写 global
+  const r = await hsMemoryAsync(["curate", item.transcript], cfg.curateTimeoutMs, st?.cwd);
   const idx = st.pending.indexOf(item);
   if (idx >= 0) st.pending.splice(idx, 1);
   if (r.ok) {
@@ -269,7 +273,7 @@ async function runCurate(ctx, cfg, sessionId, st, item) {
 
 function maybeConsolidate(ctx, cfg, sessionId, st) {
   if (cfg.consolidateEveryNCurate <= 0 || st.curateCount % cfg.consolidateEveryNCurate !== 0) return;
-  void hsMemoryAsync(["consolidate"], 90000); // 位置快速路径解析目标库
+  void hsMemoryAsync(["consolidate"], 90000, st?.cwd); // 位置快速路径解析目标库(v0.2.1 cwd 修正)
   if (shouldLog("consolidate-" + sessionId)) ctx.logger.info("hindsight: 触发 consolidate(整合去重/矛盾)");
 }
 
@@ -280,7 +284,7 @@ async function maybeCrystallize(ctx, cfg, sessionId, st) {
     if (shouldLog("crystallize-skip-" + sessionId)) ctx.logger.warn(`hindsight: 跳过 skill-crystallize(Hindsight 不可用): ${(probe.err || "").slice(0, 120)}`);
     return;
   }
-  void hsMemoryAsync(["skill-crystallize", "--bank", "repo", "--min", "3"], 120000);
+  void hsMemoryAsync(["skill-crystallize", "--bank", "repo", "--min", "3"], 120000, st?.cwd); // v0.2.1 cwd 修正 repo 解析
   if (shouldLog("crystallize-" + sessionId)) ctx.logger.info("hindsight: 触发 skill-crystallize(procedure→指令块结晶)");
 }
 
@@ -298,14 +302,14 @@ const toolRetain = {
       global: { type: "string", description: "true=全局知识→coding-agent::global(运维/通用偏好/跨项目经验)" },
     },
   },
-  execute(args) {
+  async execute(args, exec) {
     const content = String(args?.content ?? "").trim();
     if (!content) return "内容为空,未存储。";
     const argv = ["retain", content];
     if (args?.tags) argv.push("--tags", String(args.tags));
     if (String(args?.global ?? "") === "true") argv.push("--scope", "global");
     else if (String(args?.repo ?? "") === "true") argv.push("--scope", "project");
-    const r = hsMemory(argv);
+    const r = await hsMemoryAsync(argv, 90000, cwdOf(exec?.agent));
     if (!r.ok) return "❌ 存储失败: " + (r.err || r.out);
     return r.out;
   },
@@ -315,7 +319,7 @@ const toolRetain = {
 const toolRecall = {
   name: "hindsight_recall",
   description:
-    "语义搜索 Hindsight 记忆(经共享 CLI hs-memory, 自动多库合并并标注来源 [库名])。默认: 当前解析库 + coding-agent::global 合并(非 git 时即 global)。bankId: repo(仅项目库)/global(仅全局库)/显式库名(如 hermes)。factTypes: observation(默认,整合观察优先,自动去重不重复)/world(只要原始事实)/both(原始事实+observation 并列全取)/skill(只要结晶指令块)。适合: 用户提到以前聊过的事、需要历史经验/踩坑记录。注: 跨所有感知库全合并(--scope all)实测 ~14s, 已禁用。",
+    "语义搜索 Hindsight 记忆(经共享 CLI hs-memory, 自动多库合并并标注来源 [库名])。默认: 会话工作目录解析的项目库 + coding-agent::global 合并(非 git 工作目录时即 global)。bankId: repo(仅项目库)/global(仅全局库)/显式库名(如 hermes)。factTypes: observation(默认,整合观察优先,自动去重不重复)/world(只要原始事实)/both(原始事实+observation 并列全取)/skill(只要结晶指令块)。适合: 用户提到以前聊过的事、需要历史经验/踩坑记录。注: 跨所有感知库全合并(--scope all)实测 ~14s, 已禁用。",
   parameters: {
     type: "object",
     properties: {
@@ -324,7 +328,7 @@ const toolRecall = {
       factTypes: { type: "string", enum: ["observation", "world", "both", "skill"], description: "记忆类型选择(默认 observation): observation=只取整合观察(去重); world=只要原始事实; both=原始事实与 observation 并列全取; skill=只要结晶指令块。" },
     },
   },
-  execute(args) {
+  async execute(args, exec) {
     const q = String(args?.query ?? "").trim();
     if (!q) return "缺少 query。";
     const argv = ["recall", q];
@@ -338,7 +342,8 @@ const toolRecall = {
     else if (ft === "both") argv.push("--types", "world,experience,observation", "--prefer-obs", "false");
     else if (ft === "skill") argv.push("--types", "skill");
     // observation(默认): 不传 --types → 全类型召回 + 共享层 prefer_observations=True → observation 优先且去重
-    const r = hsMemory(argv);
+    // v0.2.1: 传会话 cwd, 让默认范围(当前库+global)按会话工作目录解析而非 harness 进程目录
+    const r = await hsMemoryAsync(argv, 90000, cwdOf(exec?.agent));
     if (!r.ok) return "❌ 检索失败: " + (r.err || r.out);
     return r.out;
   },
@@ -356,7 +361,7 @@ const toolReflect = {
       bankId: { type: "string", description: "记忆库: 默认当前解析库; repo=项目库; global=全局库; 或显式感知库名" },
     },
   },
-  execute(args) {
+  async execute(args, exec) {
     const q = String(args?.query ?? "").trim();
     if (!q) return "缺少 query。";
     const argv = ["reflect", q];
@@ -364,7 +369,7 @@ const toolReflect = {
     if (want === "repo") argv.push("--scope", "project");
     else if (want === "global") argv.push("--scope", "global");
     else if (want) argv.push("--bank", want);
-    const r = hsMemory(argv, 120000);
+    const r = await hsMemoryAsync(argv, 120000, cwdOf(exec?.agent));
     if (!r.ok) return "❌ 综合失败: " + (r.err || r.out);
     return r.out;
   },
@@ -376,9 +381,11 @@ const toolStatus = {
   description:
     "检查本地 Hindsight 服务状态: 列出记忆库归属(共享库可读写 / 其他 agent 独占库感知只读 / 屏蔽列表)与模型配置(配置源: hindsight 容器 env, agent 零模型认知)。",
   parameters: { type: "object", properties: {} },
-  execute() {
-    const banks = hsMemory(["list-banks"], 30000);
-    const cfg = hsMemory(["config"], 30000);
+  async execute() {
+    const [banks, cfg] = await Promise.all([
+      hsMemoryAsync(["list-banks"], 30000),
+      hsMemoryAsync(["config"], 30000),
+    ]);
     const parts = [];
     parts.push(banks.ok ? banks.out : "❌ Hindsight 不可用: " + (banks.err || "daemon 未运行\n  docker start hindsight"));
     parts.push(cfg.ok ? cfg.out : "(模型配置读取失败: " + cfg.err + ")");
@@ -414,7 +421,8 @@ function isGenericQuery(msg) {
 
 // 动态查询: 用用户首条消息做 recall query + 分数阈值过滤
 // P8: 泛化查询收紧/跳过(泛化消息对广谱召回价值低, 噪声大)
-async function doSessionStartRecall(cfg, sessionId, userMessage) {
+// v0.2.1: cwd —— 会话工作目录, 保证 --scope project 落到正确项目库
+async function doSessionStartRecall(cfg, sessionId, userMessage, cwd) {
   if (!cfg.sessionStartRecall) return null;
   if (!userMessage || userMessage.trim().length < 4) return null; // 太短的消息不查
   const q = userMessage.trim();
@@ -429,7 +437,7 @@ async function doSessionStartRecall(cfg, sessionId, userMessage) {
   argv.push("--types", "observation");
   argv.push("--top", String(generic ? cfg.sessionStartRecallGenericMax : cfg.sessionStartRecallMax));
   argv.push("--min-score", String(generic ? cfg.sessionStartRecallGenericMinScore : cfg.sessionStartRecallMinScore));
-  const r = await hsMemoryAsync(argv, cfg.sessionStartRecallTimeoutMs);
+  const r = await hsMemoryAsync(argv, cfg.sessionStartRecallTimeoutMs, cwd);
   if (r.ok && r.out && r.out.trim()) return r.out.trim();
   return null;
 }
@@ -452,7 +460,7 @@ function createHooks(ctx, cfg) {
       const text = stripInjectedMemory(textOf(message)).trim();
       if (!text || text.length < 4) return;
       // 存 promise; 泛化/空结果(null)也标记, 避免 pre-step 兜底重试
-      sessionStartRecalls.set(sessionId, doSessionStartRecall(cfg, sessionId, text) ?? true);
+      sessionStartRecalls.set(sessionId, doSessionStartRecall(cfg, sessionId, text, cwdOf(agent)) ?? true);
     },
     async preStep({ agent, signal, step, turn, messages }, next) {
       const sessionId = agent?.session?.header?.id;
@@ -465,7 +473,7 @@ function createHooks(ctx, cfg) {
         else if (!held && (step === undefined || step === 1)) {
           sessionStartRecalls.set(sessionId, true); // 兜底: 每 session 只尝试一次
           const q = promptOf(messages);
-          if (q && q.trim().length >= 4) recallPromise = doSessionStartRecall(cfg, sessionId, q.trim());
+          if (q && q.trim().length >= 4) recallPromise = doSessionStartRecall(cfg, sessionId, q.trim(), cwdOf(agent));
         }
       }
       const decision = await next();
@@ -490,7 +498,8 @@ function createHooks(ctx, cfg) {
         const prompt = promptOf(decision.messages);
         if (!prompt) return decision;
         try {
-          const r = await hsMemoryAsync(["inject", prompt], cfg.injectTimeoutMs);
+          // v0.2.1: inject 的 light 档查"当前项目库+global", cwd 修正项目库解析
+          const r = await hsMemoryAsync(["inject", prompt], cfg.injectTimeoutMs, cwdOf(agent));
           if (r.ok && r.out) {
             injectedTurns.set(agent, turn);
             const block = r.out
@@ -501,8 +510,8 @@ function createHooks(ctx, cfg) {
               .join("\n");
             blocks.push("## 相关长期记忆(Hindsight, 仅供参考, 若与当前事实冲突以当前为准)\n" + block);
           }
-        } catch {
-          // 静默失败
+        } catch (e) {
+          if (shouldLog("inject-" + sessionId)) ctx.logger.warn("hindsight: inject 失败: " + String(e?.message || e));
         }
       }
       if (blocks.length) {
@@ -515,7 +524,8 @@ function createHooks(ctx, cfg) {
       if (!sessionId) return;
       try {
         const allTurns = readDshEvents(agent?.session?.events);
-        const st = buffers.get(sessionId) ?? { turns: [], processed: 0, pending: [], curateCount: 0, evictedThisTurn: false };
+        const st = buffers.get(sessionId) ?? { turns: [], processed: 0, pending: [], curateCount: 0, evictedThisTurn: false, cwd: cwdOf(agent) };
+        st.cwd = cwdOf(agent) ?? st.cwd; // v0.2.1: 刷新会话 cwd(curate/consolidate 写路由依赖)
         st.evictedThisTurn = false; // 每 turn 重置: 超限应急抽取每轮最多一次
         // 本轮新增轮次(按 processed 游标)
         const fresh = allTurns.slice(st.processed);
@@ -581,7 +591,7 @@ function createHooks(ctx, cfg) {
         if (st?.turns?.length) parts.push(renderTranscript({ turns: st.turns }));
         for (const p of st?.pending || []) parts.push(p.transcript);
         const transcript = parts.join("\n\n");
-        void hsMemoryAsync(["session-end", transcript], 90000);
+        void hsMemoryAsync(["session-end", transcript], 90000, st?.cwd); // v0.2.1 cwd 修正写路由
       } catch {
         /* 静默失败 */
       }
@@ -595,7 +605,7 @@ function toDshParameters(spec) {
 
 export function apply(ctx, config) {
   const cfg = resolveConfig(config);
-  if (!cfg.enabled) return () => undefined;
+  if (!cfg.enabled) return;
   const hooks = createHooks(ctx, cfg);
   ctx.on("agent/session-start", hooks.sessionStart);
   ctx.on("agent/inbox/claimed", hooks.inboxClaimed, { prepend: true });
@@ -617,13 +627,17 @@ export function apply(ctx, config) {
               schema: { type: "string" },
               render: (_args, value) => [{ type: "text", text: value }],
             },
-            execute(args) {
-              return spec.execute(args ?? {});
+            execute(args, exec) {
+              // v0.2.1: 转发 exec —— 工具经 exec.agent.session.header.cwd 取会话工作目录
+              return spec.execute(args ?? {}, exec);
             },
           });
         }
       };
-      if (defer <= 0) return doRegister();
+      if (defer <= 0) {
+        doRegister();
+        return;
+      }
       const timer = setTimeout(() => {
         try {
           doRegister();
@@ -633,8 +647,16 @@ export function apply(ctx, config) {
         }
       }, defer);
       timer.unref?.();
+      // 插件卸载/热重载时清掉待注册定时器,避免向已销毁的 ctx 注册工具
+      toolCtx.effect(() => () => clearTimeout(timer), "hindsight.toolsDefer()");
     });
   }
 }
 
 export default { name, inject, apply };
+
+/**
+ * 纯函数测试面:这些函数不依赖 DSH 运行时,单测直接覆盖它们的边界。
+ * 生产代码只通过上面的 apply/tools 使用同一批实现,导出不改变任何行为。
+ */
+export const __testing = { resolveConfig, stripInjectedMemory, isGenericQuery, renderTranscript, parseArgs, shouldLog };

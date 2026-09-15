@@ -1,7 +1,9 @@
 {
   "name": "dsh-hindsight-adapt",
+  "version": "0.2.1",
   "description": "DSH Hindsight 薄适配层:经 cordis file:// 加载,转调 hs-memory 提供记忆工具与会话钩子",
-  "version": "0.1.0",
+  "author": "lws2004",
+  "license": "UNLICENSED",
   "private": true,
   "type": "module",
   "main": "plugin.mjs",
@@ -14,10 +16,11 @@
   "files": [
     "plugin.mjs",
     "recuris.mjs",
-    "RECURIS.md",
-    "test"
+    "RECURIS.md"
   ],
-  "license": "UNLICENSED",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
   }
