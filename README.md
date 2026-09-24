@@ -147,3 +147,15 @@ DSH 下次启动生效(插件在启动时加载)。
 - [打包与安装插件](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/publish.md) — Bundle/Profile 机制
 - [插件配置](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/config.md) — Config schema 定义
 - [Cordis 入门](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cordis-primer.zh.md) — 核心概念与事件模式
+
+## Model Experience
+
+None, as this plugin is disabled (the memory backend moved to OpenViking on 2026-09-16); when enabled it injected recall entries.
+
+#### KV Cache effect
+
+Independent while disabled.
+
+## Known Limitations and Deferred Work
+
+- **已停用** — 后端切至 OpenViking(:1933)；恢复步骤见本包 README 与 `~/.hindsight/README.md`。
