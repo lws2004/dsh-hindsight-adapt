@@ -1,6 +1,6 @@
 {
   "name": "dsh-hindsight-adapt",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "DSH Hindsight 薄适配层:经 cordis file:// 加载,转调 hs-memory 提供记忆工具与会话钩子",
   "author": "lws2004",
   "license": "UNLICENSED",
