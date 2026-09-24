@@ -27,6 +27,8 @@ DSH(DeepSeek Harness) 的 Hindsight 记忆集成,遵守本机统一约定
      调 `curate` / 会话结束调 `session-end`
   3. 工具: `hindsight_retain` / `hindsight_recall` / `hindsight_reflect` /
      `hindsight_status`,全部转调 `~/.hindsight/harness-memory.sh`
+     (v0.3.0 另加只读知识页三件套: `hindsight_list_knowledge_pages` /
+     `hindsight_search_knowledge_pages` / `hindsight_read_knowledge_page`,见下文)
 
 全部记忆逻辑(路由/感知/deny/密钥过滤/来源标注/策展/整合)由共享 CLI
 hs-memory 承担,本插件不重复实现。
@@ -87,6 +89,28 @@ hs-memory 承担,本插件不重复实现。
 **所有 agent 共用**(pi/ga 等直接调用即可),服务端仅认 world/experience/observation 三态类型,
 `skill`/`procedure` 等自定义类型在共享 CLI 结果侧按 context/document_id 过滤(不依赖 tags,避免 SKILL.md 语义标签误报)。
 procedure 不足阈值时自动跳过,不产生噪音。
+
+### 知识页接入(v0.3.0, 2026-09-15, 方案 B)
+
+Hindsight 0.9.0 起服务端会为项目库产出 **Knowledge Pages** —— 记忆的"投影视图"
+(架构与组件 / 约定与模式 / 核心概念 / 关键决策 / 进行中倡议),由服务端 mental model
+随 `consolidate` 自动重建,是"当下成立的结论"而非原始事实的堆叠。此前 DSH 侧零消费:
+页在服务端空转(3 个库共 16 页),会话永远看不到。本版补上**只读**读取链路,而不回到
+官方 bundle(保住按需 recall 等本机调优):
+
+| 层 | 新增 | 说明 |
+|---|---|---|
+| 共享 CLI | `hs-memory pages list\|search <query>\|read <page_id>` | 复用 `resolve_bank` 归属路由;其他 agent(pi/ga)同样可用 |
+| 插件工具 | `hindsight_list_knowledge_pages` / `hindsight_search_knowledge_pages` / `hindsight_read_knowledge_page` | 与官方 A 面(hermes/codex 面)同名同义,全部转调 CLI |
+| 会话注入 | 首轮与召回**并行**预取页目录,就绪才注入 `<hindsight_knowledge>` 块 | 未就绪即放弃(不阻塞首条);注入块由 `stripInjectedMemory` 剔除,不进 curate 转录 |
+
+开关(`cordis.patch.yml` 的 config 键,均有默认值、无需显式配置):
+`knowledgePagesEnabled`(默认 true;false 时不下发三个工具也不注入)、
+`knowledgePagesInject`(默认 true;false 时只保留工具按需调)、`knowledgePagesRosterMax`(8)、
+`knowledgePagesTimeoutMs`(15000)、`knowledgePagesGraceMs`(800)。
+
+服务端低于 0.9.0(接口 404/405/501)时 CLI 返回明确提示,插件静默跳过注入,不影响记忆主链路;
+页由服务端维护,插件全程只读、不发写请求。
 
 ## 相关文件
 

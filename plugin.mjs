@@ -35,6 +35,18 @@
 // session-end)都继承了错误 cwd, 默认读写一律错落 global(项目知识检索漏项 +
 // 项目记忆误写入 global)。修法: 全部调用点显式传 cwdOf(agent)
 // (= agent.session.header.cwd, dsh-tool-fs-search 同款取法, 会话内已验证)。
+//
+// v0.3.0 知识页接入(2026-09-15, 方案 B): 官方 coding-agents 面(A 面)的 knowledge
+// pages 此前只有服务端在产出(dsh-harness 等 3 个库共 16 页), DSH 侧零消费 ——
+// 不回到官方 bundle(保住按需 recall 等本机调优), 只补一条只读读取链路:
+//   - 共享 CLI 新增 pages 子命令(list/search/read, 复用 resolve_bank 归属路由),
+//     共享逻辑仍只存在 hs-memory 一份, 本插件只转调。
+//   - 三个工具(与官方 A 面同名同义): hindsight_list_knowledge_pages /
+//     hindsight_search_knowledge_pages / hindsight_read_knowledge_page;
+//     knowledgePagesEnabled=false 可整体回退为纯记忆形态。
+//   - 会话启动与召回并行预取页目录(roster), 就绪才注入 <hindsight_knowledge>;
+//     未就绪即放弃(不阻塞首条消息), 注入块由 stripInjectedMemory 剔除, 不污染转录。
+//   - 全程只读: 页由服务端 mental model 随 consolidate 自动重建, 插件不发写请求。
 // ═══════════════════════════════════════════════════════════════════
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -93,15 +105,23 @@ const DEFAULTS = {
   // 超时放弃注入(宁缺毋滥, 阻塞预算 = grace, 用户无感优先; 需要稳定注入可调大 grace)
   // 2026-09-04: 800→1500 未带来收益(scope project 召回 ~0.24s, 远小于 grace), 调回 800 收紧阻塞预算
   sessionStartRecallGraceMs: 800,
+  // 知识页(Knowledge Pages, 需服务端 hindsight 0.9.0+): 记忆的"投影视图"——
+  // 由服务端 mental model 随 consolidate 自动重建(架构/约定/概念/决策/倡议), 只读消费,
+  // 不会写库; 页目录由 CLI 的 pages 子命令取(共享逻辑留在 hs-memory 一份)。
+  knowledgePagesEnabled: true,    // 注册知识页工具(列/搜/读)
+  knowledgePagesInject: true,     // 会话启动注入页目录(roster); false = 只留工具按需调
+  knowledgePagesRosterMax: 8,     // 注入页条数上限(超出的页仍可用 search 工具找到)
+  knowledgePagesTimeoutMs: 15000, // 页目录/工具调用超时
+  knowledgePagesGraceMs: 800,     // 注入并行等待上限(未就绪即放弃, 不阻塞首条消息)
 };
 
 function resolveConfig(cfg) {
   const c = { ...DEFAULTS, ...(cfg || {}) };
-  for (const k of ["curateEveryN", "maxBufferChars", "curateTimeoutMs", "injectTimeoutMs", "consolidateEveryNCurate", "crystallizeEveryNCurate", "toolsDeferMs", "sessionStartRecallMax", "sessionStartRecallTimeoutMs", "sessionStartRecallMinScore", "sessionStartRecallGenericMax", "sessionStartRecallGenericMinScore", "sessionStartRecallGraceMs"]) {
+  for (const k of ["curateEveryN", "maxBufferChars", "curateTimeoutMs", "injectTimeoutMs", "consolidateEveryNCurate", "crystallizeEveryNCurate", "toolsDeferMs", "sessionStartRecallMax", "sessionStartRecallTimeoutMs", "sessionStartRecallMinScore", "sessionStartRecallGenericMax", "sessionStartRecallGenericMinScore", "sessionStartRecallGraceMs", "knowledgePagesRosterMax", "knowledgePagesTimeoutMs", "knowledgePagesGraceMs"]) {
     const n = Number(c[k]);
     c[k] = Number.isFinite(n) && n >= 0 ? n : DEFAULTS[k];
   }
-  for (const k of ["enabled", "injectEnabled", "curateEnabled", "toolsEnabled", "sessionStartRecall"]) c[k] = c[k] !== false;
+  for (const k of ["enabled", "injectEnabled", "curateEnabled", "toolsEnabled", "sessionStartRecall", "knowledgePagesEnabled", "knowledgePagesInject"]) c[k] = c[k] !== false;
   c.sessionStartRecallScope = String(c.sessionStartRecallScope || DEFAULTS.sessionStartRecallScope);
   c.sessionStartRecallGenericMode = ["tighten", "skip"].includes(c.sessionStartRecallGenericMode) ? c.sessionStartRecallGenericMode : DEFAULTS.sessionStartRecallGenericMode;
   return c;
@@ -211,6 +231,7 @@ const buffers = new Map();
 const retryCounts = new Map(); // transcript -> 连续失败次数(批次重建后仍延续)
 const injectedTurns = new WeakMap(); // agent -> turn(同 turn 只注入一次)
 const sessionStartRecalls = new Map(); // sessionId -> 广谱召回结果(待 preStep 注入)
+const knowledgeRosters = new Map(); // sessionId -> 知识页目录预取结果(待 preStep 注入)
 
 // ── 注入消息(与 dsh.js 同形, 插件来源标记 form=recall) ──
 function injectionMessage(text) {
@@ -393,7 +414,72 @@ const toolStatus = {
   },
 };
 
-const TOOLS = [toolRetain, toolRecall, toolReflect, toolStatus];
+// ── 工具: 知识页(只读) ── 转调 hs-memory pages(共享逻辑唯一留在 CLI);
+// 页由服务端 mental model 随 consolidate 自动重建, 这里只读, 不产生写入。
+// 与官方 coding-agents 面(A 面)同名同义: list / search / read 三件套。
+const PAGE_CREDIT_HINT =
+  "引用页中结论时固定用 blockquote 标注来源: > 🧠 **From Hindsight memory (<页面名>)** — <基于该页的事实或结论>";
+const toolListPages = {
+  name: "hindsight_list_knowledge_pages",
+  description:
+    "列出当前项目库的 Hindsight 知识页(记忆的投影视图: 架构/组件、约定与模式、核心概念、关键决策、进行中倡议; 服务端随记忆自动重建)。返回每页名称、id 与覆盖范围。非平凡任务开工前先列一遍, 再按需读相关页接地, 不必从代码重新推导。" +
+    PAGE_CREDIT_HINT,
+  parameters: { type: "object", properties: {} },
+  async execute(_args, exec) {
+    const r = await hsMemoryAsync(["pages", "list", "--scope", "project"], 30000, cwdOf(exec?.agent));
+    if (!r.ok) return "❌ 知识页读取失败: " + (r.err || r.out);
+    return r.out;
+  },
+};
+const toolSearchPages = {
+  name: "hindsight_search_knowledge_pages",
+  description:
+    "按主题检索当前项目库的 Hindsight 知识页(BM25+向量混合检索, 返回页级命中与摘录)。适合问本项目「怎么做的/为什么这样定/架构长什么样」——比逐条记忆召回更贴近「当前成立的结论」。" +
+    PAGE_CREDIT_HINT,
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "自然语言查询(主题/问题)" },
+      top: { type: "number", description: "返回页数上限(默认 3)" },
+    },
+  },
+  async execute(args, exec) {
+    const q = String(args?.query ?? "").trim();
+    if (!q) return "缺少 query。";
+    const top = Math.min(10, Math.max(1, Number(args?.top) || 3));
+    const r = await hsMemoryAsync(["pages", "search", q, "--scope", "project", "--top", String(top)], 30000, cwdOf(exec?.agent));
+    if (!r.ok) return "❌ 知识页检索失败: " + (r.err || r.out);
+    return r.out;
+  },
+};
+const toolReadPage = {
+  name: "hindsight_read_knowledge_page",
+  description:
+    "读一个 Hindsight 知识页的完整正文(页 id 形如 kp-…; 来自 list/search 结果或页内 [[page:<id>]] 链接)。页是记忆的投影视图, 读它是只读操作。" +
+    PAGE_CREDIT_HINT,
+  parameters: {
+    type: "object",
+    properties: {
+      pageId: { type: "string", description: "知识页 id(kp-…)" },
+      maxChars: { type: "number", description: "正文截断上限(默认 20000 字符)" },
+    },
+  },
+  async execute(args, exec) {
+    const id = String(args?.pageId ?? "").trim();
+    if (!id) return "缺少 pageId。";
+    const maxChars = Math.min(60000, Math.max(500, Number(args?.maxChars) || 20000));
+    const r = await hsMemoryAsync(["pages", "read", id, "--scope", "project", "--max-chars", String(maxChars)], 30000, cwdOf(exec?.agent));
+    if (!r.ok) return "❌ 知识页读取失败: " + (r.err || r.out);
+    return r.out;
+  },
+};
+
+const TOOLS = [toolRetain, toolRecall, toolReflect, toolStatus, toolListPages, toolSearchPages, toolReadPage];
+
+// 知识页工具按开关下发(knowledgePagesEnabled=false 时不下发, 保证纯记忆形态可回退)
+function selectTools(cfg) {
+  return TOOLS.filter((s) => cfg.knowledgePagesEnabled || !/knowledge_page/.test(s.name));
+}
 
 // ── Layer 1: 会话启动广谱召回(动态查询版) ──
 // P0 优化: 不再用固定 prompt "recent project work decisions progress context",
@@ -442,6 +528,41 @@ async function doSessionStartRecall(cfg, sessionId, userMessage, cwd) {
   return null;
 }
 
+// ── 知识页目录注入块(只读展示; 空目录/无页不注入) ──
+// CLI pages list 输出形如:
+//   [coding-agent::x] 知识页 5 个(读整页: hs-memory pages read <id>):
+//   - Component map (kp-xxx) [待重建] — 描述…
+// 或 "[bank] 暂无知识页(…)"。这里只保留条目行, 截断到 maxLines, 附读取指引。
+function knowledgeRosterBlock(cliOut, maxLines = 8) {
+  const text = String(cliOut ?? "").trim();
+  if (!text || text.includes("暂无知识页")) return null;
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const header = lines.find((l) => l.startsWith("["));
+  const items = lines.filter((l) => l.startsWith("-"));
+  if (!items.length) return null;
+  const limit = Math.max(1, Number(maxLines) || 8);
+  const shown = items.slice(0, limit);
+  const more = items.length > shown.length ? "\n(另有 " + (items.length - shown.length) + " 页, 用 hindsight_search_knowledge_pages 检索)" : "";
+  return [
+    "<hindsight_knowledge>",
+    "## 项目知识页(Hindsight Knowledge Pages, 仅供参考)",
+    header || "",
+    shown.join("\n") + more,
+    "页是记忆的投影视图(架构/约定/概念/决策/倡议), 随记忆自动重建。开工前按需读相关页, 不从代码重新推导:",
+    "- hindsight_search_knowledge_pages(query) 按主题找页; hindsight_read_knowledge_page(pageId) 读整页",
+    "引用页中结论时固定用: > 🧠 **From Hindsight memory (<页面名>)** — <结论>",
+    "</hindsight_knowledge>",
+  ].filter(Boolean).join("\n");
+}
+
+// ── 会话启动页目录预取(与召回并行; 未就绪就放弃, 空是正常结果) ──
+async function doKnowledgeRoster(cfg, cwd) {
+  if (!cfg.knowledgePagesEnabled || !cfg.knowledgePagesInject) return null;
+  const r = await hsMemoryAsync(["pages", "list", "--scope", "project"], cfg.knowledgePagesTimeoutMs, cwd);
+  if (r.ok && r.out && r.out.trim()) return r.out.trim();
+  return null;
+}
+
 // ── 会话钩子 ──
 function createHooks(ctx, cfg) {
   return {
@@ -456,7 +577,12 @@ function createHooks(ctx, cfg) {
     // 上下文组装/模型 TTFT 并行; pre-step 只读结果(窗口最大化, 零阻塞)。
     inboxClaimed({ agent, message, turn }) {
       const sessionId = agent?.session?.header?.id;
-      if (!sessionId || turn !== 1 || sessionStartRecalls.has(sessionId)) return;
+      if (!sessionId) return;
+      // 知识页目录: 首轮即与召回并行预取(未就绪即放弃, 见 preStep; 只读不写库)
+      if (turn === 1 && !knowledgeRosters.has(sessionId)) {
+        knowledgeRosters.set(sessionId, doKnowledgeRoster(cfg, cwdOf(agent)) ?? true);
+      }
+      if (turn !== 1 || sessionStartRecalls.has(sessionId)) return;
       const text = stripInjectedMemory(textOf(message)).trim();
       if (!text || text.length < 4) return;
       // 存 promise; 泛化/空结果(null)也标记, 避免 pre-step 兜底重试
@@ -489,6 +615,16 @@ function createHooks(ctx, cfg) {
         const startRecall = await Promise.race([recallPromise, graceful]);
         if (startRecall) {
           blocks.push("## 最近项目上下文(Hindsight, 仅供参考)\n" + startRecall);
+        }
+      }
+      // 知识页目录(与召回并行的只读预取; 未就绪就放弃注入, 空目录是正常结果)
+      if (cfg.knowledgePagesEnabled && cfg.knowledgePagesInject) {
+        const rosterHeld = knowledgeRosters.get(sessionId);
+        if (rosterHeld instanceof Promise) {
+          const gracePages = new Promise((r) => setTimeout(() => r(null), cfg.knowledgePagesGraceMs));
+          const rosterOut = await Promise.race([rosterHeld, gracePages]);
+          const pageBlock = knowledgeRosterBlock(rosterOut, cfg.knowledgePagesRosterMax);
+          if (pageBlock) blocks.push(pageBlock);
         }
       }
       // Layer 2: prompt-based inject(仅 injectEnabled 时)
@@ -582,6 +718,7 @@ function createHooks(ctx, cfg) {
       if (!sessionId) return;
       liveAgents.delete(sessionId);
       sessionStartRecalls.delete(sessionId);
+      knowledgeRosters.delete(sessionId);
       const st = buffers.get(sessionId);
       buffers.delete(sessionId);
       try {
@@ -618,7 +755,7 @@ export function apply(ctx, config) {
     const defer = Math.max(0, Number(cfg.toolsDeferMs) || 0);
     ctx.inject(["tools"], (toolCtx) => {
       const doRegister = () => {
-        for (const spec of TOOLS) {
+        for (const spec of selectTools(cfg)) {
           toolCtx.tools.register({
             name: spec.name,
             description: spec.description,
@@ -659,4 +796,4 @@ export default { name, inject, apply };
  * 纯函数测试面:这些函数不依赖 DSH 运行时,单测直接覆盖它们的边界。
  * 生产代码只通过上面的 apply/tools 使用同一批实现,导出不改变任何行为。
  */
-export const __testing = { resolveConfig, stripInjectedMemory, isGenericQuery, renderTranscript, parseArgs, shouldLog };
+export const __testing = { resolveConfig, stripInjectedMemory, isGenericQuery, renderTranscript, parseArgs, shouldLog, knowledgeRosterBlock, selectTools };
