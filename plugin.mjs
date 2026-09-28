@@ -239,7 +239,7 @@ function injectionMessage(text) {
     id: randomUUID(),
     role: "user",
     content: [{ type: "text", text }],
-    source: { kind: "plugin", plugin: name, form: "recall" },
+    source: { kind: "plugin:" + name, plugin: name, form: "recall" },
   };
 }
 

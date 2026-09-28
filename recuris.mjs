@@ -1774,7 +1774,7 @@ function createHooks(ctx, cfg) {
                   id: randomUUID(),
                   role: "user",
                   content: [{ type: "text", text: blocks.join("\n\n") }],
-                  source: { kind: "plugin", plugin: name, form: "session-start" },
+                  source: { kind: "plugin:" + name, plugin: name, form: "session-start" },
                 }],
               };
             }
@@ -1803,7 +1803,7 @@ function createHooks(ctx, cfg) {
               id: randomUUID(),
               role: "user",
               content: [{ type: "text", text: blocks.join("\n\n") }],
-              source: { kind: "plugin", plugin: name, form: "working-memory" },
+              source: { kind: "plugin:" + name, plugin: name, form: "working-memory" },
             },
           ],
         };
