@@ -4,24 +4,55 @@
   "description": "DSH Hindsight 薄适配层:经 cordis file:// 加载,转调 hs-memory 提供记忆工具与会话钩子",
   "author": "lws2004",
   "license": "UNLICENSED",
+  "homepage": "https://github.com/lws2004/dsh-hindsight-adapt#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lws2004/dsh-hindsight-adapt.git"
+  },
+  "keywords": [
+    "deepseek",
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "hindsight",
+    "memory-tools",
+    "session-hooks"
+  ],
   "private": true,
   "type": "module",
   "main": "plugin.mjs",
   "exports": {
     ".": {
+      "types": "./plugin.d.ts",
       "default": "./plugin.mjs"
     },
     "./package.json": "./package.json"
   },
   "files": [
     "plugin.mjs",
+    "plugin.d.ts",
     "recuris.mjs",
-    "RECURIS.md"
+    "cordis.patch.yml",
+    "RECURIS.md",
+    "locale",
+    "icon.svg"
   ],
   "scripts": {
     "test": "node --test \"test/*.test.js\""
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "types": "plugin.d.ts",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "Hindsight Adapter",
+    "description": "Thin DSH adapter that loads Hindsight over cordis file:// and turns hs-memory into memory tools and session hooks."
   }
 }

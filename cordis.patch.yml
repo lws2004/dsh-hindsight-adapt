@@ -1,0 +1,6 @@
+# dsh-hindsight-adapt: profile 将其列入 dsh.profile.bundles 时应用的 layer。
+# 注意: 本插件历史上是以 file:// 直插形态接入的(~/.dsh/cordis.patch.yml 里那段被停用的 insert),
+# 本文件只在它改为 bundle 通道接入后才生效 —— 两种方式不要同时开。
+- insert:
+    - id: hindsight-adapt
+      name: dsh-hindsight-adapt

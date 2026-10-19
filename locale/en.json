@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Hindsight Adapter",
+    "description": "Thin DSH adapter that loads Hindsight over cordis file:// and turns hs-memory into memory tools and session hooks."
+  }
+}

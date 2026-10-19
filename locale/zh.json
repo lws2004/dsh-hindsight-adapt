@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Hindsight 适配层",
+    "description": "经 cordis file:// 加载的 Hindsight 薄适配层，把 hs-memory 转成记忆工具与会话钩子"
+  }
+}
