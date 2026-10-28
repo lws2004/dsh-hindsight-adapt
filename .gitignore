@@ -1,3 +1,4 @@
 soft-backup-*.json
 *.bak-*
 plugin.mjs.bak-*
+bun.lock
